@@ -51,14 +51,14 @@ TIMEZONE=Asia/Kolkata                     # used for daily auto-clear time and m
 - **Clear now** per chat, or **Clear all chats**. `/clear` in Telegram clears the current chat.
 - Bots cannot read chat history, so the bot remembers the IDs of messages it sends and commands it handles, and deletes those. Telegram only allows deleting messages younger than 48 hours; messages sent before this feature existed can't be cleared.
 
-**Webhooks tab** – transaction notifications pushed by your payment API
-- **+ New webhook** gives you a URL like `https://<your-domain>/webhook/<id>/<secret>`. Paste it into your provider's webhook settings. The panel must be reachable from the internet (e.g. your Railway domain) – `localhost` won't work.
-- **Notify for** ❌ Failed, ⏳ Pending, ✅ Success – each can be switched on/off. Notifications go to all alert chats, or to specific chat IDs.
-- **Security** – pick one: secret in the URL (simplest), secret in a header (e.g. `X-Webhook-Secret`, `Bearer` accepted), or an **HMAC-SHA256 signature** header (hex or base64, optional `sha256=` prefix) using your provider's signing secret. Deliveries that fail the check are rejected with 401.
-- The transaction is read from the body whether it's the object itself, a list, or wrapped (`data`, `transaction`, `payload`…). The status comes from `status`/`txn_status`, or from the event name (`payment.failed` → FAILED). Which words mean failed/pending/success is editable per webhook.
-- Retries are de-duplicated: one notification per transaction + status. Blocked accounts are skipped.
-- **Also count towards consecutive-failure alerts** feeds webhook results into the same failure-streak alerts as the transactions API (a transaction is never counted twice).
-- **Test failed / pending / success** sends a sample notification. **Recent deliveries** shows the last 25 calls with the result and the raw payload (kept in memory only).
+**Transaction webhooks** (Functions tab → *Transaction failures* card) – transaction updates pushed by your vendor
+- **+ Add webhook** gives you a URL like `https://<your-domain>/webhook/<long-random-id>`. Paste it into your vendor's webhook settings. The panel must be reachable from the internet (e.g. your Railway domain) – `localhost` won't work.
+- **“In a row” alerts** (default **5**): when a customer has 5 **failed** transactions in a row, one alert is sent with the customer name, organisation, and all 5 transactions (ID, amount, time, failure reason). Same for 5 **pending** in a row (with status and pending reason). Repeats at 10, 15 …; a “Failures stopped” / “Pending cleared” message follows when the customer's latest transaction is no longer failed / pending. A pending transaction that later turns successful or failed is updated in place. 0 = off.
+- **Every single transaction** (optional, off by default): one message per ❌ failed / ⏳ pending / ✅ successful transaction. Alerts go to all alert chats, or to specific chat IDs.
+- **Security** (optional): *No secret* (default – the vendor just posts to the URL; keep the URL private), secret in the URL, secret in a header, or an HMAC-SHA256 signature header. For header/HMAC the secret can be a separate webhook secret or the function's master secret / master key.
+- Customer, organisation and reason are read from common field names (`customer_name`, `organisation_name` / `organization_name` / `org_name` / `merchant_name`, `failure_reason` / `pending_reason` / `reason` / `status_message` / `remarks` …). The transaction may be the body itself, a list, or wrapped (`data`, `transaction`, `payload`…); the status comes from `status`/`txn_status` or the event name (`payment.failed` → FAILED). Status words are editable per webhook.
+- Switching the *Transaction failures* function off pauses its webhooks (deliveries are answered with 200 but ignored). Retries are de-duplicated; blocked accounts are skipped. Deliveries are processed in arrival order.
+- **Test 5 failed / Test 5 pending** send a sample “in a row” alert; **Recent deliveries** shows the last 25 calls with the streak progress (e.g. `failed 3/5`) and the raw payload.
 
 **Commands tab**
 - Every built-in command (`/status`, `/balance`, `/bal`, `/low`, `/failures`, `/check`, `/clear`, `/id`) can be **renamed**, given a new **description**, and switched **Active / Inactive**. Inactive commands are ignored by the bot and hidden from `/help` and Telegram's command menu.
