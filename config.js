@@ -122,8 +122,8 @@ function createConfigStore({ file, env, writeJson }) {
   };
   // blank key/secret keeps the stored value
   const keyFields = (data, existing) => ({
-    key: text(data.key, 500, 'Key') || existing?.key || '',
-    secret: text(data.secret, 500, 'Secret') || existing?.secret || '',
+    key: text(data.key, Infinity, 'Key') || existing?.key || '',
+    secret: text(data.secret, Infinity, 'Secret') || existing?.secret || '',
     keyHeader: header(data.keyHeader, existing?.keyHeader ?? 'x-trexo-key', 'Key header'),
     secretHeader: header(data.secretHeader, existing?.secretHeader ?? 'x-trexo-secret', 'Secret header'),
   });
