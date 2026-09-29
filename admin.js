@@ -40,6 +40,21 @@ function redirect(res, to) {
   res.end();
 }
 
+// raw bytes (needed to verify webhook HMAC signatures)
+function readRawBody(req, limit = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) { reject(new Error('Body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
@@ -82,7 +97,7 @@ async function lookupLabel(bot, id) {
   }
 }
 
-function startAdmin({ port, host, user, password, trustProxy, getBot, access, runBalanceCheck, sendTest, chats, settings, commands, functions }) {
+function startAdmin({ port, host, user, password, trustProxy, getBot, access, runBalanceCheck, sendTest, chats, settings, commands, functions, webhooks }) {
   if (!password) {
     console.warn('ADMIN_PASSWORD not set – admin panel disabled');
     return null;
@@ -125,6 +140,18 @@ function startAdmin({ port, host, user, password, trustProxy, getBot, access, ru
       const url = new URL(req.url, 'http://local');
       const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
       const session = getSession(req);
+
+      // --- transaction webhooks (public – authenticated by the webhook's own secret/signature) ---
+      // POST /webhook/:id   or   POST /webhook/:id/:secret
+      if (parts[0] === 'webhook' && (parts.length === 2 || parts.length === 3)) {
+        if (req.method !== 'POST') return json(res, 405, { error: 'Use POST' });
+        const rawBody = await readRawBody(req);
+        const r = webhooks.receive({
+          id: parts[1], pathSecret: parts[2], headers: req.headers, rawBody,
+          contentType: req.headers['content-type'],
+        });
+        return json(res, r.status, r.body);
+      }
 
       // Writes require a JSON content type – blocks simple cross-site form posts
       if (req.method !== 'GET' && !String(req.headers['content-type'] || '').startsWith('application/json')) {
@@ -257,6 +284,43 @@ function startAdmin({ port, host, user, password, trustProxy, getBot, access, ru
           const info = await settings.setBotToken(token);
           console.log(`[ADMIN] ${session.user} changed the Telegram bot token (now @${info?.username})`);
           return json(res, 200, { ok: true, bot: info });
+        }
+      }
+
+      // --- webhooks admin ---
+      if (parts[1] === 'webhooks') {
+        const [, , whId, action] = parts;
+        // GET /api/webhooks
+        if (req.method === 'GET' && parts.length === 2) return json(res, 200, webhooks.view());
+
+        // POST /api/webhooks  { id?, name, auth, headerName, secret, notify, statuses, chatIds, feedStreaks, enabled }
+        if (req.method === 'POST' && parts.length === 2) {
+          const body = await readBody(req);
+          const id = webhooks.upsert(body);
+          console.log(`[ADMIN] ${session.user} ${body.id ? 'updated' : 'created'} webhook "${String(body.name || '').slice(0, 60)}"`);
+          return json(res, 200, { ok: true, id });
+        }
+
+        // DELETE /api/webhooks/:id
+        if (req.method === 'DELETE' && parts.length === 3) {
+          webhooks.remove(whId);
+          console.log(`[ADMIN] ${session.user} deleted webhook ${whId}`);
+          return json(res, 200, { ok: true });
+        }
+
+        // POST /api/webhooks/:id/secret  – new random secret
+        if (req.method === 'POST' && action === 'secret' && parts.length === 4) {
+          webhooks.regenerateSecret(whId);
+          console.log(`[ADMIN] ${session.user} regenerated the secret of webhook ${whId}`);
+          return json(res, 200, { ok: true });
+        }
+
+        // POST /api/webhooks/:id/test  { kind: failed|pending|success }
+        if (req.method === 'POST' && action === 'test' && parts.length === 4) {
+          const { kind } = await readBody(req);
+          await webhooks.test(whId, kind);
+          console.log(`[ADMIN] ${session.user} sent a test ${kind} notification for webhook ${whId}`);
+          return json(res, 200, { ok: true });
         }
       }
 
