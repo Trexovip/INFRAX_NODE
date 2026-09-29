@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bot Admin</title>
+<title>INFRAX Bot Admin</title>
 <style>
   :root {
     --bg: #f6f7f9; --card: #fff; --text: #1b1f24; --muted: #667085; --border: #e3e6ea;
@@ -101,6 +101,16 @@
   .dot.off { background: var(--danger); }
   .inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .inline input[type="number"] { width: 80px; }
+  button.toggle { min-width: 84px; font-weight: 500; }
+  button.toggle.on { color: var(--ok); border-color: currentColor; }
+  button.toggle.off { color: var(--muted); }
+  .cmd-input { display: flex; align-items: center; gap: 2px; min-width: 150px; }
+  .cmd-input span { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #cmds input { width: 100%; }
+  #cmds td { vertical-align: top; }
+  #cmds td.what { font-size: 12px; max-width: 220px; }
+  #help-preview { margin: 0; padding: 12px 14px; background: var(--row); border: 1px solid var(--border); border-radius: 8px;
+                  white-space: pre-wrap; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-x: auto; }
   .warn-box { background: color-mix(in srgb, #b26a00 10%, transparent); border: 1px solid color-mix(in srgb, #b26a00 35%, transparent); border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 14px; }
 </style>
 </head>
@@ -118,6 +128,7 @@
     <button type="button" role="tab" data-tab="access" aria-selected="true">Access</button>
     <button type="button" role="tab" data-tab="accounts" aria-selected="false">Accounts</button>
     <button type="button" role="tab" data-tab="chats" aria-selected="false">Chats</button>
+    <button type="button" role="tab" data-tab="commands" aria-selected="false">Commands</button>
     <button type="button" role="tab" data-tab="functions" aria-selected="false">Functions</button>
     <button type="button" role="tab" data-tab="settings" aria-selected="false">Settings</button>
     <button type="button" role="tab" data-tab="logs" aria-selected="false">Logs</button>
@@ -240,6 +251,26 @@
       <button class="primary">Save token</button>
     </form>
     <p class="hint" style="margin:0">The token is checked with Telegram before it replaces the current one. The bot reconnects immediately.</p>
+  </section>
+  </div>
+
+  <div id="tab-commands" hidden>
+  <section>
+    <h2>Bot commands</h2>
+    <p class="hint">Rename any command, change the text shown in /help, and switch commands on or off. Inactive commands are ignored by the bot and hidden from /help and the Telegram menu. Changes apply immediately.</p>
+    <div class="table-wrap"><table id="cmds"></table></div>
+  </section>
+
+  <section>
+    <h2>Function commands <span class="count" id="fncmds-count">0</span></h2>
+    <p class="hint">Commands you created in the Functions tab. Switching one off also pauses its alerts.</p>
+    <div class="table-wrap"><table id="fncmds"></table></div>
+  </section>
+
+  <section>
+    <h2>/help preview</h2>
+    <p class="hint">This is exactly what the bot replies to /help (and /start).</p>
+    <pre id="help-preview"></pre>
   </section>
   </div>
 
@@ -556,8 +587,75 @@ function showTab(name) {
   if (name === 'chats') loadChats();
   if (name === 'settings') loadSettings();
   if (name === 'functions') loadFunctions();
+  if (name === 'commands') loadCommands();
 }
-const TABS = ['access', 'accounts', 'chats', 'functions', 'settings', 'logs'];
+const TABS = ['access', 'accounts', 'chats', 'commands', 'functions', 'settings', 'logs'];
+
+// --- commands ---
+function toggleButton(on, onClick, locked) {
+  const b = el('button', { type: 'button', className: `toggle ${on ? 'on' : 'off'}`, textContent: on ? '● Active' : '○ Inactive' });
+  if (locked) { b.disabled = true; b.title = 'Always active'; }
+  b.onclick = () => onClick(!on, b);
+  return b;
+}
+
+async function loadCommands() {
+  let data;
+  try { data = await api('GET', '/api/commands'); }
+  catch (e) { return toast('Failed to load commands: ' + e.message, true); }
+
+  const table = $('#cmds');
+  table.replaceChildren(el('tr', {},
+    el('th', { textContent: 'Status' }), el('th', { textContent: 'Command' }),
+    el('th', { textContent: 'Description (shown in /help)' }), el('th', { textContent: 'What it does' }), el('th')));
+
+  for (const c of data.commands) {
+    const cmdIn = el('input', { value: c.command, autocomplete: 'off', spellcheck: false });
+    const descIn = el('input', { value: c.description, autocomplete: 'off' });
+    const save = el('button', { type: 'button', className: 'primary', textContent: 'Save', disabled: true });
+    const dirty = () => (save.disabled = cmdIn.value.trim().replace(/^\//, '').toLowerCase() === c.command && descIn.value.trim() === c.description);
+    cmdIn.oninput = descIn.oninput = dirty;
+    const saveBody = (enabled) => ({ command: cmdIn.value.trim(), description: descIn.value.trim(), enabled });
+    save.onclick = () => run(save, () => api('POST', `/api/commands/${c.key}`, saveBody(c.enabled)), `Saved /${cmdIn.value.trim().replace(/^\//, '')}`).then(loadCommands);
+    const toggle = toggleButton(c.enabled, (enabled, b) =>
+      run(b, () => api('POST', `/api/commands/${c.key}`, { command: c.command, description: c.description, enabled }),
+        `/${c.command} ${enabled ? 'activated' : 'deactivated'}`).then(loadCommands), c.locked);
+
+    const what = el('td', { className: 'what muted', textContent: c.what });
+    if (c.command !== c.defaultCommand) what.append(el('div', { textContent: `Originally /${c.defaultCommand}` }));
+    table.append(el('tr', { className: c.enabled ? '' : 'dim' },
+      el('td', {}, toggle),
+      el('td', {}, el('div', { className: 'cmd-input' }, el('span', { textContent: '/' }), cmdIn)),
+      el('td', {}, descIn),
+      what,
+      el('td', { className: 'actions' }, save)));
+  }
+
+  const fnTable = $('#fncmds');
+  $('#fncmds-count').textContent = data.functions.length;
+  fnTable.replaceChildren();
+  if (!data.functions.length) {
+    fnTable.append(el('tr', {}, el('td', { className: 'empty', colSpan: 4, textContent: 'No functions yet – create one in the Functions tab.' })));
+  } else {
+    fnTable.append(el('tr', {},
+      el('th', { textContent: 'Status' }), el('th', { textContent: 'Command' }), el('th', { textContent: 'Description' }), el('th')));
+    for (const f of data.functions) {
+      const toggle = toggleButton(f.enabled, (enabled, b) =>
+        run(b, () => api('POST', `/api/functions/${encodeURIComponent(f.id)}/enabled`, { enabled }),
+          `/${f.command} ${enabled ? 'activated' : 'deactivated'}`).then(loadCommands));
+      const edit = el('button', { type: 'button', textContent: 'Edit in Functions' });
+      edit.onclick = () => showTab('functions');
+      fnTable.append(el('tr', { className: f.enabled ? '' : 'dim' },
+        el('td', {}, toggle),
+        el('td', {}, el('code', { textContent: '/' + f.command })),
+        el('td', { textContent: f.description || f.name }),
+        el('td', { className: 'actions' }, edit)));
+    }
+  }
+
+  // help text is Telegram HTML – show it as plain text
+  $('#help-preview').textContent = new DOMParser().parseFromString(data.help, 'text/html').body.textContent;
+}
 
 // --- chats ---
 let chatData = null;
