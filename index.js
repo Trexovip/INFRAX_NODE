@@ -808,39 +808,23 @@ const who = (msg) => {
   return `${name ? name + ' ' : ''}(${u.id}) in chat ${msg.chat.id}`;
 };
 
-const BUILTIN_COMMANDS = [
-  { command: 'status', description: 'Bot health & thresholds' },
-  { command: 'balance', description: 'All account balances' },
-  { command: 'bal', description: 'Live balance of an account – /bal 7854' },
-  { command: 'low', description: 'Accounts below threshold' },
-  { command: 'failures', description: 'Customers with active failure streaks' },
-  { command: 'check', description: 'Run balance & transaction checks now' },
-  { command: 'clear', description: "Delete the bot's messages in this chat" },
-  { command: 'id', description: 'Show chat/user ID' },
-];
-
+// Built-in commands: names, descriptions and on/off come from the admin panel (Commands tab)
+const activeBuiltinCommands = () => config.commands().filter((c) => c.enabled);
 const activeCustomFunctions = () => config.customFunctions().filter((f) => f.enabled);
+const cmd = (key) => '/' + (config.commands().find((c) => c.key === key)?.command || key);
 
+// /help – generated from whatever is active right now
 function helpText() {
-  const custom = activeCustomFunctions().map((f) => `/${f.command} – ${esc(f.description || f.name)}`).join('\n');
-  return `<b>Internal Monitoring Bot</b>\n\n` +
-    `/status – bot health & thresholds\n` +
-    `/balance – all account balances\n` +
-    `/balance &lt;search&gt; or /bal &lt;search&gt; – live balance of a specific account\n` +
-    `   e.g. /bal 7854  ·  /bal Deepak  ·  /bal 786543214567854\n` +
-    `/low – accounts below threshold\n` +
-    `/failures – customers with active failure streaks\n` +
-    `/check – run both checks now\n` +
-    `/clear – delete the bot's messages in this chat\n` +
-    `/id – show chat/user ID` +
-    (custom ? `\n\n<b>Functions</b>\n${custom}` : '');
+  const builtins = activeBuiltinCommands().map((c) => `/${c.command} – ${esc(c.description)}`);
+  const fns = activeCustomFunctions().map((f) => `/${f.command} – ${esc(f.description || f.name)}`);
+  return `<b>Commands</b>\n${builtins.join('\n')}` + (fns.length ? `\n\n<b>Functions</b>\n${fns.join('\n')}` : '');
 }
 
-// keep Telegram's "/" command menu in sync with the functions
+// keep Telegram's "/" command menu in sync with the active commands
 function syncBotCommands() {
   if (!bot) return;
   const commands = [
-    ...BUILTIN_COMMANDS,
+    ...activeBuiltinCommands().map((c) => ({ command: c.command, description: c.description.slice(0, 256) })),
     ...activeCustomFunctions().map((f) => ({ command: f.command, description: (f.description || f.name).slice(0, 256) })),
   ];
   bot.setMyCommands(commands).catch((e) => console.error('Could not update bot command menu:', e.message));
@@ -852,7 +836,8 @@ async function guarded(msg, handler) {
   if (!isAllowed(msg)) {
     console.warn(`[DENIED] ${who(msg)}: ${msg.text}`);
     recordAccessRequest(msg);
-    return send(msg.chat.id, '⛔ Not authorised. Send /id and ask admin to whitelist you.');
+    const idCmd = activeBuiltinCommands().find((c) => c.key === 'id');
+    return send(msg.chat.id, `⛔ Not authorised. ${idCmd ? `Send /${idCmd.command} and ask` : "Ask"} the admin to give you access.`);
   }
   console.log(`[CMD] ${who(msg)}: ${msg.text}`);
   try {
@@ -893,26 +878,11 @@ async function balanceLookup(msg, q) {
   return send(msg.chat.id, `${text}\n\n<i>Live as of ${fmtTime(Date.now())}</i>`);
 }
 
-function registerHandlers(b) {
-  const command = (regex, handler) => b.onText(regex, (msg, match) => guarded(msg, () => handler(msg, match)));
+// What each built-in command does, by key (its /name is configurable)
+const COMMAND_HANDLERS = {
+  help: (msg) => send(msg.chat.id, helpText()),
 
-  // custom functions from the admin panel – looked up per message, so new ones work immediately
-  b.onText(/^\/([A-Za-z0-9_]{1,32})(?:@\w+)?(?:\s+([\s\S]+))?$/, (msg, match) => {
-    const fn = activeCustomFunctions().find((f) => f.command === match[1].toLowerCase());
-    if (!fn) return;
-    return guarded(msg, () => runFunctionCommand(msg, fn, (match[2] || '').trim()));
-  });
-
-  // /id works for everyone so you can find chat IDs during setup
-  b.onText(/^\/id(?:@\w+)?(?:\s|$)/, (msg) => {
-    trackMessage(msg.chat.id, msg.message_id, msg.date * 1000);
-    if (!isAllowed(msg)) recordAccessRequest(msg);
-    return send(msg.chat.id, `Chat ID: <code>${msg.chat.id}</code>\nYour user ID: <code>${msg.from?.id}</code>`);
-  });
-
-  command(/^\/(start|help)(?:@\w+)?(?:\s|$)/, (msg) => send(msg.chat.id, helpText()));
-
-  command(/^\/status(?:@\w+)?(?:\s|$)/, (msg) => {
+  status: (msg) => {
     const apis = config.get().functions.map((f) => {
       const rows = f.apis.map((a) => {
         const errs = state.apiErrors[f.builtin ? a.id : `${f.id}:${a.id}`];
@@ -936,18 +906,18 @@ function registerHandlers(b) {
       `Active failure streaks: ${Object.values(state.streaks).filter((s) => s.count > 0).length}\n` +
       `Chat auto-clear: ${ac.enabled ? (ac.mode === 'daily' ? `daily at ${ac.time}` : 'continuous') + `, older than ${ac.olderThanHours}h` : 'off'}`
     );
-  });
+  },
 
-  command(/^\/bal(?:@\w+)?(?:\s+(.+))?$/, (msg, match) => {
-    const q = (match[1] || '').trim().toLowerCase();
-    if (!q) return send(msg.chat.id, 'Usage: <code>/bal &lt;account number / last 4 digits / name&gt;</code>\nExample: <code>/bal 7854</code>');
+  // /bal <account no | last digits | name | bank | id>  -> live lookup
+  bal: (msg, arg) => {
+    const q = arg.toLowerCase();
+    if (!q) return send(msg.chat.id, `Usage: <code>${cmd('bal')} &lt;account number / last 4 digits / name&gt;</code>\nExample: <code>${cmd('bal')} 7854</code>`);
     return balanceLookup(msg, q);
-  });
+  },
 
-  // /balance            -> all accounts
-  // /balance <search>   -> specific account (live)
-  command(/^\/balance(?:@\w+)?(?:\s+(.+))?$/, (msg, match) => {
-    const q = (match[1] || '').trim().toLowerCase();
+  // /balance -> all accounts · /balance <search> -> specific account (live)
+  balance: (msg, arg) => {
+    const q = arg.toLowerCase();
     if (q) return balanceLookup(msg, q);
     const rows = Object.values(state.balances).sort((a, b) => a.balance - b.balance);
     if (!rows.length) return send(msg.chat.id, 'No balance data yet.');
@@ -955,9 +925,9 @@ function registerHandlers(b) {
       `${a.balance < cfg.balanceThreshold ? '🔴' : '🟢'} <b>${esc(a.customerName || '-')}</b> | ${esc(a.bankName || '-')} | <code>${esc(a.accountNumber)}</code> | ${inr(a.balance)}`
     ).join('\n');
     return send(msg.chat.id, `<b>Balances</b> (lowest first)\n\n${text}`);
-  });
+  },
 
-  command(/^\/low(?:@\w+)?(?:\s|$)/, (msg) => {
+  low: (msg) => {
     const rows = Object.entries(state.lowBalance);
     if (!rows.length) return send(msg.chat.id, '✅ All accounts above threshold.');
     const text = rows.map(([id, l]) => {
@@ -965,9 +935,9 @@ function registerHandlers(b) {
       return `🔴 <b>${esc(a.customerName || '-')}</b> | ${esc(a.bankName || '-')} | <code>${esc(a.accountNumber || id)}</code> | ${inr(l.balance)} | since ${fmtTime(l.since)}`;
     }).join('\n');
     return send(msg.chat.id, `<b>Low Balance Accounts</b>\n\n${text}`);
-  });
+  },
 
-  command(/^\/failures(?:@\w+)?(?:\s|$)/, (msg) => {
+  failures: (msg) => {
     const rows = Object.entries(state.streaks).filter(([, s]) => s.count > 0).sort((a, b) => b[1].count - a[1].count);
     if (!rows.length) return send(msg.chat.id, '✅ No active failure streaks.');
     const text = rows.map(([id, s]) =>
@@ -975,17 +945,45 @@ function registerHandlers(b) {
       (s.recent.at(-1)?.reason ? ` (last: ${esc(s.recent.at(-1).reason)})` : '')
     ).join('\n');
     return send(msg.chat.id, `<b>Failure Streaks</b>\n\n${text}`);
-  });
+  },
 
-  command(/^\/check(?:@\w+)?(?:\s|$)/, async (msg) => {
+  check: async (msg) => {
     await send(msg.chat.id, '⏳ Running checks...');
     await Promise.all([checkBalances(), checkTransactions()]);
-    await send(msg.chat.id, '✅ Checks complete. Use /status for details.');
-  });
+    await send(msg.chat.id, `✅ Checks complete. Use ${cmd('status')} for details.`);
+  },
 
-  command(/^\/clear(?:@\w+)?(?:\s|$)/, async (msg) => {
-    const r = await clearChats({ chatId: msg.chat.id, reason: `/clear by ${who(msg)}` });
+  clear: async (msg) => {
+    const r = await clearChats({ chatId: msg.chat.id, reason: `${cmd('clear')} by ${who(msg)}` });
     if (r.failed) await send(msg.chat.id, `🧹 Cleared ${r.deleted} message(s). ${r.failed} could not be deleted (older than 48h, or the bot is not a group admin).`);
+  },
+
+  id: (msg) => send(msg.chat.id, `Chat ID: <code>${msg.chat.id}</code>\nYour user ID: <code>${msg.from?.id}</code>`),
+};
+
+// One dispatcher for every command – looks up the current names per message,
+// so renaming or switching commands on/off in the admin panel works immediately.
+function registerHandlers(b) {
+  b.onText(/^\/([A-Za-z0-9_]{1,32})(?:@(\w+))?(?:\s+([\s\S]+))?$/, (msg, match) => {
+    const name = match[1].toLowerCase();
+    if (match[2] && botInfo && match[2].toLowerCase() !== botInfo.username.toLowerCase()) return; // /cmd@OtherBot
+    const arg = (match[3] || '').trim();
+
+    const builtin = name === 'start'
+      ? config.commands().find((c) => c.key === 'help')
+      : activeBuiltinCommands().find((c) => c.command === name);
+
+    // the ID command works for everyone, so new chats/users can find their IDs
+    if (builtin?.key === 'id') {
+      trackMessage(msg.chat.id, msg.message_id, msg.date * 1000);
+      if (!isAllowed(msg)) recordAccessRequest(msg);
+      return COMMAND_HANDLERS.id(msg);
+    }
+    if (builtin) return guarded(msg, () => COMMAND_HANDLERS[builtin.key](msg, arg));
+
+    const fn = activeCustomFunctions().find((f) => f.command === name);
+    if (fn) return guarded(msg, () => runFunctionCommand(msg, fn, arg));
+    // anything else (unknown or switched-off command) is ignored
   });
 
   b.on('polling_error', (e) => console.error('Telegram polling error:', e.message));
@@ -1068,6 +1066,16 @@ require('./admin').startAdmin({
   settings: {
     view: () => ({ telegram: config.publicTelegram(), bot: botInfo, timezone: cfg.timezone }),
     setBotToken: changeBotToken,
+  },
+
+  commands: {
+    view: () => ({
+      commands: config.commands(),
+      functions: config.customFunctions().map((f) => ({ id: f.id, name: f.name, command: f.command, description: f.description, enabled: f.enabled })),
+      help: helpText(),
+    }),
+    update: (key, data) => { const c = config.updateCommand(key, data); syncBotCommands(); return c; },
+    setFunctionEnabled: (id, enabled) => { config.setFunctionEnabled(id, enabled); syncBotCommands(); },
   },
 
   functions: {
