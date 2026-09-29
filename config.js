@@ -24,8 +24,8 @@ const BUILTIN_COMMANDS = [
   { key: 'balance', command: 'balance', description: 'All account balances (or add a search)', what: 'All tracked balances, lowest first; with text it searches' },
   { key: 'bal', command: 'bal', description: 'Live balance of an account – e.g. 7854 or a name', what: 'Live lookup by account number, last digits, name or bank' },
   { key: 'low', command: 'low', description: 'Accounts below threshold', what: 'Accounts currently under the low-balance threshold' },
-  { key: 'failures', command: 'failures', description: 'Customers with active failure streaks', what: 'Customers with consecutive failed transactions' },
-  { key: 'check', command: 'check', description: 'Run balance & transaction checks now', what: 'Runs the balance and transaction checks immediately' },
+  { key: 'failures', command: 'failures', description: 'Customers with failed / pending transactions in a row', what: 'Customers whose latest vendor transactions are failed or pending in a row' },
+  { key: 'check', command: 'check', description: 'Run the balance check now', what: 'Runs the balance check immediately' },
   { key: 'clear', command: 'clear', description: "Delete the bot's messages in this chat", what: 'Deletes bot messages (under 48h) in the current chat' },
   { key: 'id', command: 'id', description: 'Show chat/user ID', what: 'Replies with the chat ID and user ID – works for everyone, even without access' },
 ];
@@ -58,9 +58,23 @@ function newApi(data = {}) {
 function builtinFunctions() {
   return [
     { id: 'balance', builtin: 'balance', name: 'Balance check', command: 'bal', description: 'Low-balance alerts · /bal, /balance, /low', enabled: true, master: emptyKey(), apis: [] },
-    { id: 'transactions', builtin: 'transactions', name: 'Transaction failures', command: 'failures', description: 'Consecutive failure alerts · /failures', enabled: true, master: emptyKey(), apis: [] },
+    { id: 'transactions', builtin: 'transactions', name: 'Transaction failures', command: 'failures', description: 'Vendor sends failed & pending transactions · alerts after N in a row · /failures', enabled: true, master: emptyKey(), apis: [] },
   ];
 }
+
+
+// incoming transactions (vendor → bot) for the built-in Transaction failures function
+const DEFAULT_INBOX_STATUSES = {
+  failed: 'FAILED,FAILURE,DECLINED,REJECTED,ERROR',
+  pending: 'PENDING,PROCESSING,INITIATED,IN_PROGRESS,CREATED,SUBMITTED',
+  success: 'SUCCESS,SUCCESSFUL,COMPLETED,SETTLED',
+};
+const defaultInbox = () => ({
+  token: crypto.randomBytes(16).toString('hex'), // the URL's random part – the only protection (no secret)
+  failedInRow: 5,
+  pendingInRow: 5,
+  statuses: { ...DEFAULT_INBOX_STATUSES },
+});
 
 function seedFromEnv(env) {
   const fns = builtinFunctions();
@@ -68,7 +82,6 @@ function seedFromEnv(env) {
   fns[0].master = { ...master };
   fns[1].master = { ...master };
   if (env.BALANCE_API_URL) fns[0].apis.push(newApi({ id: 'balance', name: 'Balances', url: env.BALANCE_API_URL }));
-  if (env.TXN_API_URL) fns[1].apis.push(newApi({ id: 'transactions', name: 'Transactions', url: env.TXN_API_URL, sinceParam: env.TXN_SINCE_PARAM ?? 'from' }));
   return fns;
 }
 
@@ -111,6 +124,11 @@ function createConfigStore({ file, env, writeJson }) {
   }
   // built-in functions always exist
   for (const b of builtinFunctions()) if (!config.functions.some((f) => f.id === b.id)) config.functions.unshift(b);
+  // Transaction failures no longer polls an API – the vendor pushes transactions to its incoming URL
+  const txFn = config.functions.find((f) => f.id === 'transactions');
+  txFn.apis = [];
+  if (/^Consecutive failure alerts/.test(txFn.description || '')) txFn.description = builtinFunctions()[1].description;
+  txFn.inbox = { ...defaultInbox(), ...(txFn.inbox || {}) };
 
   const save = () => {
     try { writeJson(file, config); } catch (e) { console.error('Failed to save config file:', e.message); }
@@ -184,6 +202,7 @@ function createConfigStore({ file, env, writeJson }) {
     // every secret value, so the logger can mask them
     secrets: () => [
       config.telegram.botToken,
+      config.functions.find((f) => f.id === 'transactions')?.inbox?.token,
       ...config.functions.flatMap((f) => [f.master?.key, f.master?.secret, ...f.apis.flatMap((a) => [a.key, a.secret])]),
     ],
 
@@ -271,8 +290,36 @@ function createConfigStore({ file, env, writeJson }) {
       save();
     },
 
+    // --- incoming transactions (Transaction failures) ---
+    inbox: () => config.functions.find((f) => f.id === 'transactions').inbox,
+    defaultInboxStatuses: () => ({ ...DEFAULT_INBOX_STATUSES }),
+
+    updateInbox(data) {
+      const fn = findFn('transactions');
+      const statuses = {};
+      for (const k of Object.keys(DEFAULT_INBOX_STATUSES)) {
+        statuses[k] = text(data.statuses?.[k] ?? fn.inbox.statuses[k], 500, `${k} statuses`).toUpperCase().replace(/\s+/g, '');
+      }
+      fn.inbox = {
+        ...fn.inbox,
+        failedInRow: num(data.failedInRow ?? fn.inbox.failedInRow, 'Failed in a row', { min: 0, max: 50, int: true }),
+        pendingInRow: num(data.pendingInRow ?? fn.inbox.pendingInRow, 'Pending in a row', { min: 0, max: 50, int: true }),
+        statuses,
+      };
+      save();
+      return fn.inbox;
+    },
+
+    regenerateInboxToken() {
+      const fn = findFn('transactions');
+      fn.inbox = { ...fn.inbox, token: defaultInbox().token };
+      save();
+      return fn.inbox;
+    },
+
     upsertApi(fnId, data) {
       const fn = findFn(fnId);
+      if (fn.builtin === 'transactions') throw new Error('Transaction failures has no APIs – your vendor sends transactions to its incoming URL');
       const existing = data.id ? fn.apis.find((a) => a.id === data.id) : null;
       if (data.id && !existing) throw new Error('API not found');
       const name = text(data.name, 60, 'Name');
@@ -294,7 +341,6 @@ function createConfigStore({ file, env, writeJson }) {
         enabled: data.enabled !== false,
         ...(keyMode === 'own' ? keyFields(data, existing) : { ...emptyKey(), key: '', secret: '' }),
       });
-      if (fn.builtin === 'transactions') entry.sinceParam = param(data.sinceParam, 'since parameter');
       if (!fn.builtin) {
         entry.method = data.method === 'POST' ? 'POST' : 'GET';
         entry.query = text(data.query, 500, 'Query parameters');
