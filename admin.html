@@ -29,7 +29,6 @@
   .hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
   form { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
   input { flex: 1 1 180px; min-width: 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
-  input[type="checkbox"] { flex: none; width: auto; }
   input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   button { padding: 7px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; }
   button:hover { border-color: var(--muted); }
@@ -102,9 +101,6 @@
   .dot.off { background: var(--danger); }
   .inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .inline input[type="number"] { width: 80px; }
-  .webhook { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px; background: var(--row); }
-  .webhook h3 { font-size: 14px; margin: 0 0 4px; display: flex; gap: 8px; align-items: center; }
-  .webhook.dim { opacity: .7; }
   button.toggle { min-width: 84px; font-weight: 500; }
   button.toggle.on { color: var(--ok); border-color: currentColor; }
   button.toggle.off { color: var(--muted); }
@@ -399,75 +395,6 @@
     </form>
   </section>
 
-  <div class="warn-box" id="wh-local" hidden>This panel is open on <b>localhost</b> – payment providers can't reach it. Webhooks work once the bot runs on a public HTTPS address (e.g. your Railway domain).</div>
-
-  <section id="wh-editor" hidden>
-    <form id="wh-form" class="stack">
-      <h2 id="wh-form-title">New webhook</h2>
-      <input type="hidden" name="id">
-      <input type="hidden" name="fnId">
-      <div class="fields">
-        <label>Name<input name="name" placeholder="e.g. Trexo payouts" required autocomplete="off"></label>
-        <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
-      </div>
-
-      <div class="form-title">“In a row” alerts <span class="muted" style="font-weight:400">– one alert per customer listing every transaction with its ID and reason</span></div>
-      <div class="fields">
-        <label>🚨 Alert after this many failed in a row (0 = off)<input name="streakFailed" type="number" min="0" max="50" step="1" value="5"></label>
-        <label>⏳ Alert after this many pending in a row (0 = off)<input name="streakPending" type="number" min="0" max="50" step="1" value="5"></label>
-      </div>
-      <p class="hint">The alert shows the customer name, organisation, and each transaction's ID, amount, time and reason. It repeats at 2×, 3× … and a “stopped / cleared” message follows when the customer's latest transaction is no longer failed / pending.</p>
-
-      <div class="form-title">Every single transaction <span class="muted" style="font-weight:400">– optional, one message per transaction</span></div>
-      <div class="inline" style="gap:18px; margin-bottom:12px">
-        <label class="inline"><input type="checkbox" name="nFailed"> ❌ Failed</label>
-        <label class="inline"><input type="checkbox" name="nPending"> ⏳ Pending</label>
-        <label class="inline"><input type="checkbox" name="nSuccess"> ✅ Success</label>
-      </div>
-      <div class="fields">
-        <label>Send to chat IDs (blank = all alert chats)<input name="chatIds" placeholder="-1001234567890, -1009876543210" autocomplete="off"></label>
-        <label class="check"><input type="checkbox" name="feedStreaks"> Also count in /failures (Transaction failures streaks)</label>
-      </div>
-
-      <div class="form-title">Security <span class="muted" style="font-weight:400">– optional check that a delivery really comes from your vendor</span></div>
-      <div class="fields">
-        <label>Method
-          <select name="auth">
-            <option value="none">No secret – vendor just posts to the URL</option>
-            <option value="url">Secret in the URL</option>
-            <option value="header">Secret in a header</option>
-            <option value="hmac">HMAC-SHA256 signature header</option>
-          </select>
-        </label>
-        <label data-hdr>Header name<input name="headerName" autocomplete="off"></label>
-        <label data-hdr>Secret to use
-          <select name="secretSource">
-            <option value="own">Separate webhook secret</option>
-            <option value="master_secret">Function's master secret</option>
-            <option value="master_key">Function's master key</option>
-          </select>
-        </label>
-        <label data-own-secret>Secret<input name="secret" autocomplete="off" placeholder="leave blank to generate one"></label>
-      </div>
-      <p class="hint" id="wh-auth-hint"></p>
-
-      <details style="margin-bottom:12px">
-        <summary class="muted" style="cursor:pointer">Status words (advanced)</summary>
-        <div class="fields" style="margin-top:10px">
-          <label>Failed<input name="sFailed" autocomplete="off"></label>
-          <label>Pending<input name="sPending" autocomplete="off"></label>
-          <label>Success<input name="sSuccess" autocomplete="off"></label>
-        </div>
-        <p class="hint">Comma-separated, case-insensitive. The status is read from <code>status</code> / <code>txn_status</code>, or from the event name (e.g. <code>payment.failed</code>).</p>
-      </details>
-
-      <div class="inline">
-        <button class="primary">Save webhook</button>
-        <button type="button" data-cancel>Cancel</button>
-      </div>
-    </form>
-  </section>
-
   <div id="fn-list"></div>
   </div>
 
@@ -490,7 +417,6 @@
       <button type="button" data-q="[DENIED]" aria-pressed="false">Denied access</button>
       <button type="button" data-q="[ADMIN]" aria-pressed="false">Admin actions</button>
       <button type="button" data-q="[CLEAR]" aria-pressed="false">Chat clears</button>
-      <button type="button" data-q="[WEBHOOK]" aria-pressed="false">Webhooks</button>
     </div>
     <div id="logs"></div>
     <p class="hint" id="log-info" style="margin:10px 0 0"></p>
@@ -664,207 +590,6 @@ function showTab(name) {
   if (name === 'commands') loadCommands();
 }
 const TABS = ['access', 'accounts', 'chats', 'commands', 'functions', 'settings', 'logs'];
-
-// --- webhooks (shown inside their function's card in the Functions tab) ---
-let whData = { webhooks: [], deliveries: {}, defaults: {} };
-const AUTH_TEXT = { none: 'no secret', url: 'secret in the URL', header: 'secret header', hmac: 'HMAC-SHA256 signature' };
-const SECRET_TEXT = { master_secret: "function's master secret", master_key: "function's master key" };
-
-async function loadWebhooks() {
-  $('#wh-local').hidden = !/^(localhost|127\.|\[::1\])/.test(location.hostname);
-  whData = await api('GET', '/api/webhooks');
-}
-
-const webhookUrl = (w) => `${location.origin}/webhook/${w.id}${w.auth === 'url' ? '/' + w.secret : ''}`;
-
-function copyButton(label, getText) {
-  const b = el('button', { type: 'button', textContent: label });
-  b.onclick = async () => {
-    try { await navigator.clipboard.writeText(getText()); toast('Copied'); }
-    catch { toast('Copy failed – select the text and copy it manually', true); }
-  };
-  return b;
-}
-
-// the "Webhooks" block inside a function card
-function webhooksBlock(fn) {
-  const block = el('div');
-  const hooks = whData.webhooks.filter((w) => w.fnId === fn.id);
-  const add = el('button', { type: 'button', className: 'primary', textContent: '+ Add webhook' });
-  add.onclick = () => openWhEditor(null, fn);
-  block.append(
-    el('div', { className: 'form-title', textContent: `Webhooks (${hooks.length})` }),
-    el('p', { className: 'hint', textContent: 'Your payment API pushes each transaction update to a webhook URL and the bot posts a Failed / Pending / Success notification.' + (fn.enabled ? '' : ' This function is switched off, so deliveries are accepted but ignored.') }));
-
-  for (const w of hooks) {
-    const kinds = [w.notify.failed && '❌ Failed', w.notify.pending && '⏳ Pending', w.notify.success && '✅ Success'].filter(Boolean);
-    const streaks = [w.streak?.failed && `🚨 ${w.streak.failed} failed in a row`, w.streak?.pending && `⏳ ${w.streak.pending} pending in a row`].filter(Boolean);
-    const usesHeader = w.auth === 'header' || w.auth === 'hmac';
-    const usesMaster = usesHeader && w.secretSource !== 'own';
-
-    // secret row: own secret (show / copy / regenerate) or the function's master key/secret
-    let secretCell;
-    let secretActions = '';
-    if (usesMaster) {
-      secretCell = el('span', { textContent: `Uses the ${SECRET_TEXT[w.secretSource]}` });
-    } else {
-      const code = el('code', { textContent: '•'.repeat(16) });
-      let shown = false;
-      const showBtn = el('button', { type: 'button', textContent: 'Show' });
-      showBtn.onclick = () => { shown = !shown; code.textContent = shown ? w.secret : '•'.repeat(16); showBtn.textContent = shown ? 'Hide' : 'Show'; };
-      secretCell = code;
-      secretActions = el('span', {}, showBtn, ' ', copyButton('Copy', () => w.secret), ' ',
-        confirmButton('New secret', () => api('POST', `/api/webhooks/${w.id}/secret`), 'New secret generated – update it at your provider', loadFunctions));
-    }
-
-    const info = el('table', {},
-      el('tr', {}, el('td', { className: 'muted', textContent: 'Webhook URL' }),
-        el('td', {}, el('code', { className: 'url', style: 'max-width:420px', textContent: webhookUrl(w), title: webhookUrl(w) })),
-        el('td', { className: 'actions' }, copyButton('Copy URL', () => webhookUrl(w)))),
-      usesHeader ? el('tr', {}, el('td', { className: 'muted', textContent: w.auth === 'hmac' ? 'Signature header' : 'Header' }),
-        el('td', {}, el('code', { textContent: w.headerName })), el('td')) : '',
-      w.auth === 'none' ? el('tr', {}, el('td', { className: 'muted', textContent: 'Security' }),
-        el('td', { textContent: 'No secret – anyone with this URL can post. Keep it private.' }), el('td')) : el('tr', {},
-        el('td', { className: 'muted', textContent: w.auth === 'hmac' ? 'Signing secret' : 'Secret' }),
-        el('td', {}, secretCell),
-        el('td', { className: 'actions' }, secretActions)));
-
-    const actions = el('div', { className: 'row-actions' });
-    const tests = [['failed_streak', `Test ${w.streak?.failed || 5} failed`], ['pending_streak', `Test ${w.streak?.pending || 5} pending`],
-      ['failed', 'Test single failed'], ['pending', 'Test single pending'], ['success', 'Test single success']];
-    for (const [kind, label] of tests) {
-      const b = el('button', { type: 'button', textContent: label });
-      b.onclick = () => run(b, () => api('POST', `/api/webhooks/${w.id}/test`, { kind }), 'Test alert sent').then(loadFunctions);
-      actions.append(b);
-    }
-    const edit = el('button', { type: 'button', textContent: 'Edit webhook' });
-    edit.onclick = () => openWhEditor(w, fn);
-    actions.append(edit, confirmButton('Delete webhook', () => api('DELETE', `/api/webhooks/${w.id}`), 'Webhook deleted', loadFunctions));
-
-    // recent deliveries
-    const dl = whData.deliveries[w.id] || [];
-    const dTable = el('table');
-    if (!dl.length) {
-      dTable.append(el('tr', {}, el('td', { className: 'empty', colSpan: 3, textContent: 'No deliveries yet (since the bot last started).' })));
-    } else {
-      dTable.append(el('tr', {}, el('th', { textContent: 'Received' }), el('th', { textContent: 'Result' }), el('th', { textContent: 'Transactions' })));
-      for (const d of dl) {
-        const ok = d.httpStatus === 200;
-        const txns = el('td');
-        if (d.note) txns.append(el('div', { className: 'muted', textContent: d.note }));
-        for (const t of d.txns) {
-          txns.append(el('div', {},
-            el('code', { textContent: t.id || '?' }), ` ${t.status || '?'} `,
-            el('span', { className: `tag ${t.kind === 'failed' ? 'low' : t.kind === 'success' ? 'ok' : ''}`, textContent: t.kind }),
-            t.streak ? el('span', { className: 'muted', textContent: ` ${t.streak} ` }) : '',
-            t.notified ? el('span', { className: 'tag ok', textContent: 'notified' }) : t.note ? el('span', { className: 'muted', textContent: t.note }) : ''));
-        }
-        if (d.body) {
-          txns.append(el('details', {}, el('summary', { className: 'muted', style: 'cursor:pointer', textContent: 'Payload' }),
-            el('pre', { style: 'white-space:pre-wrap;word-break:break-all;margin:6px 0 0;font-size:12px', textContent: prettyJson(d.body) })));
-        }
-        dTable.append(el('tr', {},
-          el('td', { className: 'muted', textContent: fmt(d.at) }),
-          el('td', {}, el('span', { className: `tag ${ok ? 'ok' : 'low'}`, textContent: ok ? '✓ 200' : `✗ ${d.httpStatus}` })),
-          txns));
-      }
-    }
-
-    block.append(el('div', { className: 'webhook' + (w.enabled ? '' : ' dim') },
-      el('h3', {}, '🔗 ', w.name, w.enabled ? '' : el('span', { className: 'tag', textContent: 'Disabled' })),
-      el('p', { className: 'hint', textContent:
-        `Alerts: ${[...streaks, ...kinds.map((k) => k + ' (each)')].join(', ') || 'nothing'} · to ${w.chatIds || 'all alert chats'} · ${AUTH_TEXT[w.auth]}` +
-        (w.feedStreaks ? ' · also counted in /failures' : '') }),
-      el('div', { className: 'table-wrap' }, info),
-      actions,
-      el('details', { open: dl.some((d) => d.httpStatus !== 200) },
-        el('summary', { className: 'muted', style: 'cursor:pointer;margin-top:10px', textContent: `Recent deliveries (${dl.length})` }),
-        el('div', { className: 'table-wrap' }, dTable))));
-  }
-  block.append(el('div', { className: 'row-actions' }, add));
-  return block;
-}
-
-function prettyJson(s) {
-  try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
-}
-
-function syncWhForm() {
-  const form = $('#wh-form');
-  const f = form.elements;
-  const auth = f.namedItem('auth').value;
-  const src = f.namedItem('secretSource');
-  const usesHeader = auth === 'header' || auth === 'hmac';
-  if (!usesHeader) src.value = 'own';
-  form.querySelectorAll('[data-hdr]').forEach((n) => (n.hidden = !usesHeader));
-  form.querySelector('[data-own-secret]').hidden = auth === 'none' || src.value !== 'own';
-  const hdr = f.namedItem('headerName');
-  if (!hdr.value || ['X-Webhook-Secret', 'X-Signature'].includes(hdr.value)) hdr.value = auth === 'hmac' ? 'X-Signature' : 'X-Webhook-Secret';
-  const which = src.value === 'own' ? 'the secret below' : `the ${SECRET_TEXT[src.value]}`;
-  $('#wh-auth-hint').textContent = {
-    none: 'No check – the vendor just posts to the URL. The URL contains a long random ID; keep it private, anyone who has it can send data.',
-    url: 'The secret is part of the URL – just paste the URL into your provider. Simplest, but the URL itself must be kept private.',
-    header: `Your provider sends ${which} in this header on every call (a "Bearer " prefix is accepted).`,
-    hmac: `Your provider signs the request body with ${which} (HMAC-SHA256, hex or base64, optional "sha256=" prefix).`,
-  }[auth];
-}
-$('#wh-form').addEventListener('change', syncWhForm);
-
-function openWhEditor(w, fn) {
-  const form = $('#wh-form');
-  form.reset();
-  const f = form.elements;
-  const d = whData.defaults;
-  f.namedItem('id').value = w?.id || '';
-  f.namedItem('fnId').value = fn.id;
-  f.namedItem('name').value = w?.name || '';
-  f.namedItem('enabled').checked = w ? w.enabled : true;
-  f.namedItem('nFailed').checked = w ? w.notify.failed : false;
-  f.namedItem('nPending').checked = w ? w.notify.pending : false;
-  f.namedItem('nSuccess').checked = w ? w.notify.success : false;
-  f.namedItem('streakFailed').value = w?.streak?.failed ?? 5;
-  f.namedItem('streakPending').value = w?.streak?.pending ?? 5;
-  f.namedItem('chatIds').value = w?.chatIds || '';
-  f.namedItem('feedStreaks').checked = w ? w.feedStreaks : false;
-  f.namedItem('auth').value = w?.auth || 'none';
-  f.namedItem('headerName').value = w?.headerName || '';
-  f.namedItem('secretSource').value = w?.secretSource || 'own';
-  f.namedItem('secret').value = '';
-  f.namedItem('secret').placeholder = w ? 'leave blank to keep the current secret' : 'leave blank to generate one';
-  f.namedItem('sFailed').value = w?.statuses.failed ?? d.failed;
-  f.namedItem('sPending').value = w?.statuses.pending ?? d.pending;
-  f.namedItem('sSuccess').value = w?.statuses.success ?? d.success;
-  $('#wh-form-title').textContent = w ? `Edit webhook “${w.name}” · ${fn.name}` : `Add webhook to ${fn.name}`;
-  syncWhForm();
-  showEditor('wh');
-}
-
-$('#wh-form [data-cancel]').onclick = () => showEditor(null);
-
-$('#wh-form').addEventListener('submit', (ev) => {
-  ev.preventDefault();
-  const f = ev.target.elements;
-  const v = (k) => f.namedItem(k).value.trim();
-  const c = (k) => f.namedItem(k).checked;
-  const body = {
-    fnId: v('fnId'), name: v('name'), enabled: c('enabled'),
-    notify: { failed: c('nFailed'), pending: c('nPending'), success: c('nSuccess') },
-    streak: { failed: Number(v('streakFailed')), pending: Number(v('streakPending')) },
-    chatIds: v('chatIds'), feedStreaks: c('feedStreaks'),
-    auth: v('auth'), headerName: v('headerName'), secretSource: v('secretSource'), secret: v('secret'),
-    statuses: { failed: v('sFailed'), pending: v('sPending'), success: v('sSuccess') },
-  };
-  if (v('id')) body.id = v('id');
-  run(ev.target.querySelector('button.primary'), async () => {
-    await api('POST', '/api/webhooks', body);
-    showEditor(null);
-  }, 'Webhook saved').then(loadFunctions);
-});
-
-// keep delivery lists fresh while the Functions tab is open (not while editing)
-setInterval(() => {
-  if (!$('#tab-functions').hidden && $('#fn-editor').hidden && $('#api-editor').hidden && $('#wh-editor').hidden) loadFunctions();
-}, 15000);
 
 // --- commands ---
 function toggleButton(on, onClick, locked) {
@@ -1052,7 +777,7 @@ const OP_TEXT = { '<': 'below', '<=': 'at or below', '>': 'above', '>=': 'at or 
 const KEY_TEXT = { master: 'Master key', own: 'Own key', none: 'No key' };
 
 async function loadFunctions() {
-  try { [fnData] = await Promise.all([api('GET', '/api/functions'), loadWebhooks()]); }
+  try { fnData = await api('GET', '/api/functions'); }
   catch (e) { return toast('Failed to load functions: ' + e.message, true); }
   renderFunctions();
 }
@@ -1134,16 +859,14 @@ function renderFunctions() {
       actions.append(confirmButton('Delete function', () => api('DELETE', `/api/functions/${encodeURIComponent(fn.id)}`), 'Function deleted', loadFunctions));
     }
 
-    // Transaction failures: its webhooks are managed right here
-    const extra = fn.builtin === 'transactions' ? webhooksBlock(fn) : '';
-    list.append(el('section', {}, title, hint, el('div', { className: 'table-wrap' }, table), actions, extra));
+    list.append(el('section', {}, title, hint, el('div', { className: 'table-wrap' }, table), actions));
   }
 }
 
 function showEditor(which) {
-  const ids = { fn: '#fn-editor', api: '#api-editor', wh: '#wh-editor' };
-  for (const [k, id] of Object.entries(ids)) $(id).hidden = which !== k;
-  if (which) $(ids[which]).scrollIntoView({ behavior: 'smooth', block: 'start' });
+  $('#fn-editor').hidden = which !== 'fn';
+  $('#api-editor').hidden = which !== 'api';
+  if (which) $(which === 'fn' ? '#fn-editor' : '#api-editor').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 function openFnEditor(fn) {
