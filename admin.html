@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>INFRAX Bot Admin</title>
+<title>Bot Admin</title>
 <style>
   :root {
     --bg: #f6f7f9; --card: #fff; --text: #1b1f24; --muted: #667085; --border: #e3e6ea;
@@ -29,6 +29,7 @@
   .hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
   form { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
   input { flex: 1 1 180px; min-width: 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+  input[type="checkbox"] { flex: none; width: auto; }
   input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   button { padding: 7px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; }
   button:hover { border-color: var(--muted); }
@@ -128,6 +129,7 @@
     <button type="button" role="tab" data-tab="access" aria-selected="true">Access</button>
     <button type="button" role="tab" data-tab="accounts" aria-selected="false">Accounts</button>
     <button type="button" role="tab" data-tab="chats" aria-selected="false">Chats</button>
+    <button type="button" role="tab" data-tab="webhooks" aria-selected="false">Webhooks</button>
     <button type="button" role="tab" data-tab="commands" aria-selected="false">Commands</button>
     <button type="button" role="tab" data-tab="functions" aria-selected="false">Functions</button>
     <button type="button" role="tab" data-tab="settings" aria-selected="false">Settings</button>
@@ -252,6 +254,67 @@
     </form>
     <p class="hint" style="margin:0">The token is checked with Telegram before it replaces the current one. The bot reconnects immediately.</p>
   </section>
+  </div>
+
+  <div id="tab-webhooks" hidden>
+  <div class="row-actions" style="margin:0 0 16px">
+    <button type="button" class="primary" id="new-wh">+ New webhook</button>
+    <span class="muted">Your payment API sends each transaction update to the webhook URL, and the bot posts a Failed / Pending / Success notification.</span>
+  </div>
+  <div class="warn-box" id="wh-local" hidden>This panel is open on <b>localhost</b> – payment providers can't reach it. Webhooks work once the bot runs on a public HTTPS address (e.g. your Railway domain).</div>
+
+  <section id="wh-editor" hidden>
+    <form id="wh-form" class="stack">
+      <h2 id="wh-form-title">New webhook</h2>
+      <input type="hidden" name="id">
+      <div class="fields">
+        <label>Name<input name="name" placeholder="e.g. Trexo payouts" required autocomplete="off"></label>
+        <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+      </div>
+
+      <div class="form-title">Notify for</div>
+      <div class="inline" style="gap:18px; margin-bottom:12px">
+        <label class="inline"><input type="checkbox" name="nFailed" checked> ❌ Failed</label>
+        <label class="inline"><input type="checkbox" name="nPending"> ⏳ Pending</label>
+        <label class="inline"><input type="checkbox" name="nSuccess"> ✅ Success</label>
+      </div>
+      <div class="fields">
+        <label>Send to chat IDs (blank = all alert chats)<input name="chatIds" placeholder="-1001234567890, -1009876543210" autocomplete="off"></label>
+        <label class="check"><input type="checkbox" name="feedStreaks" checked> Also count towards consecutive-failure alerts</label>
+      </div>
+
+      <div class="form-title">Security <span class="muted" style="font-weight:400">– how the bot knows a delivery really comes from your provider</span></div>
+      <div class="fields">
+        <label>Method
+          <select name="auth">
+            <option value="url">Secret in the URL</option>
+            <option value="header">Secret in a header</option>
+            <option value="hmac">HMAC-SHA256 signature header</option>
+          </select>
+        </label>
+        <label data-hdr>Header name<input name="headerName" autocomplete="off"></label>
+        <label>Secret<input name="secret" autocomplete="off" placeholder="leave blank to generate one"></label>
+      </div>
+      <p class="hint" id="wh-auth-hint"></p>
+
+      <details style="margin-bottom:12px">
+        <summary class="muted" style="cursor:pointer">Status words (advanced)</summary>
+        <div class="fields" style="margin-top:10px">
+          <label>Failed<input name="sFailed" autocomplete="off"></label>
+          <label>Pending<input name="sPending" autocomplete="off"></label>
+          <label>Success<input name="sSuccess" autocomplete="off"></label>
+        </div>
+        <p class="hint">Comma-separated, case-insensitive. The status is read from <code>status</code> / <code>txn_status</code>, or from the event name (e.g. <code>payment.failed</code>).</p>
+      </details>
+
+      <div class="inline">
+        <button class="primary">Save webhook</button>
+        <button type="button" data-cancel>Cancel</button>
+      </div>
+    </form>
+  </section>
+
+  <div id="wh-list"></div>
   </div>
 
   <div id="tab-commands" hidden>
@@ -417,6 +480,7 @@
       <button type="button" data-q="[DENIED]" aria-pressed="false">Denied access</button>
       <button type="button" data-q="[ADMIN]" aria-pressed="false">Admin actions</button>
       <button type="button" data-q="[CLEAR]" aria-pressed="false">Chat clears</button>
+      <button type="button" data-q="[WEBHOOK]" aria-pressed="false">Webhooks</button>
     </div>
     <div id="logs"></div>
     <p class="hint" id="log-info" style="margin:10px 0 0"></p>
@@ -588,8 +652,178 @@ function showTab(name) {
   if (name === 'settings') loadSettings();
   if (name === 'functions') loadFunctions();
   if (name === 'commands') loadCommands();
+  if (name === 'webhooks') loadWebhooks();
 }
-const TABS = ['access', 'accounts', 'chats', 'commands', 'functions', 'settings', 'logs'];
+const TABS = ['access', 'accounts', 'chats', 'webhooks', 'commands', 'functions', 'settings', 'logs'];
+
+// --- webhooks ---
+let whData = null;
+const AUTH_TEXT = { url: 'Secret in the URL', header: 'Secret header', hmac: 'HMAC-SHA256 signature' };
+
+async function loadWebhooks() {
+  $('#wh-local').hidden = !/^(localhost|127\.|\[::1\])/.test(location.hostname);
+  try { whData = await api('GET', '/api/webhooks'); }
+  catch (e) { return toast('Failed to load webhooks: ' + e.message, true); }
+  renderWebhooks();
+}
+
+const webhookUrl = (w) => `${location.origin}/webhook/${w.id}${w.auth === 'url' ? '/' + w.secret : ''}`;
+
+function copyButton(label, getText) {
+  const b = el('button', { type: 'button', textContent: label });
+  b.onclick = async () => {
+    try { await navigator.clipboard.writeText(getText()); toast('Copied'); }
+    catch { toast('Copy failed – select the text and copy it manually', true); }
+  };
+  return b;
+}
+
+function renderWebhooks() {
+  const list = $('#wh-list');
+  list.replaceChildren();
+  if (!whData.webhooks.length) {
+    list.append(el('section', {}, el('p', { className: 'muted', style: 'margin:0', textContent: 'No webhooks yet – click “+ New webhook”.' })));
+    return;
+  }
+  for (const w of whData.webhooks) {
+    const kinds = [w.notify.failed && '❌ Failed', w.notify.pending && '⏳ Pending', w.notify.success && '✅ Success'].filter(Boolean);
+    const title = el('h2', {}, w.name, w.enabled ? '' : el('span', { className: 'tag', textContent: 'Disabled' }));
+    const hint = el('p', { className: 'hint', textContent:
+      `Notifies: ${kinds.join(', ') || 'nothing'} · to ${w.chatIds || 'all alert chats'} · ${AUTH_TEXT[w.auth]}` +
+      (w.feedStreaks ? ' · counts towards failure streaks' : '') });
+
+    // URL + secret
+    const secretCode = el('code', { textContent: '•'.repeat(16) });
+    let shown = false;
+    const showBtn = el('button', { type: 'button', textContent: 'Show' });
+    showBtn.onclick = () => { shown = !shown; secretCode.textContent = shown ? w.secret : '•'.repeat(16); showBtn.textContent = shown ? 'Hide' : 'Show'; };
+    const regen = confirmButton('New secret', () => api('POST', `/api/webhooks/${w.id}/secret`), 'New secret generated – update it at your provider', loadWebhooks);
+    const info = el('table', {},
+      el('tr', {}, el('td', { className: 'muted', textContent: 'Webhook URL' }),
+        el('td', {}, el('code', { className: 'url', style: 'max-width:420px', textContent: webhookUrl(w), title: webhookUrl(w) })),
+        el('td', { className: 'actions' }, copyButton('Copy URL', () => webhookUrl(w)))),
+      w.auth !== 'url' ? el('tr', {}, el('td', { className: 'muted', textContent: w.auth === 'hmac' ? 'Signature header' : 'Header' }),
+        el('td', {}, el('code', { textContent: w.headerName })), el('td')) : '',
+      el('tr', {}, el('td', { className: 'muted', textContent: w.auth === 'hmac' ? 'Signing secret' : 'Secret' }),
+        el('td', {}, secretCode),
+        el('td', { className: 'actions' }, showBtn, copyButton('Copy', () => w.secret), regen)));
+
+    // actions
+    const actions = el('div', { className: 'row-actions' });
+    for (const kind of ['failed', 'pending', 'success']) {
+      const b = el('button', { type: 'button', textContent: `Test ${kind}` });
+      b.onclick = () => run(b, () => api('POST', `/api/webhooks/${w.id}/test`, { kind }), `Test ${kind} notification sent`).then(loadWebhooks);
+      actions.append(b);
+    }
+    const edit = el('button', { type: 'button', textContent: 'Edit' });
+    edit.onclick = () => openWhEditor(w);
+    actions.append(edit, confirmButton('Delete', () => api('DELETE', `/api/webhooks/${w.id}`), 'Webhook deleted', loadWebhooks));
+
+    // recent deliveries
+    const dl = whData.deliveries[w.id] || [];
+    const dTable = el('table');
+    if (!dl.length) {
+      dTable.append(el('tr', {}, el('td', { className: 'empty', colSpan: 3, textContent: 'No deliveries yet (since the bot last started).' })));
+    } else {
+      dTable.append(el('tr', {}, el('th', { textContent: 'Received' }), el('th', { textContent: 'Result' }), el('th', { textContent: 'Transactions' })));
+      for (const d of dl) {
+        const ok = d.httpStatus === 200;
+        const txns = el('td');
+        if (d.note) txns.append(el('div', { className: 'muted', textContent: d.note }));
+        for (const t of d.txns) {
+          txns.append(el('div', {},
+            el('code', { textContent: t.id || '?' }), ` ${t.status || '?'} `,
+            el('span', { className: `tag ${t.kind === 'failed' ? 'low' : t.kind === 'success' ? 'ok' : ''}`, textContent: t.kind }),
+            t.notified ? el('span', { className: 'tag ok', textContent: 'notified' }) : t.note ? el('span', { className: 'muted', textContent: t.note }) : ''));
+        }
+        if (d.body) {
+          const det = el('details', {}, el('summary', { className: 'muted', style: 'cursor:pointer', textContent: 'Payload' }),
+            el('pre', { style: 'white-space:pre-wrap;word-break:break-all;margin:6px 0 0;font-size:12px', textContent: prettyJson(d.body) }));
+          txns.append(det);
+        }
+        dTable.append(el('tr', {},
+          el('td', { className: 'muted', textContent: fmt(d.at) }),
+          el('td', {}, el('span', { className: `tag ${ok ? 'ok' : 'low'}`, textContent: ok ? '✓ 200' : `✗ ${d.httpStatus}` })),
+          txns));
+      }
+    }
+
+    list.append(el('section', { className: w.enabled ? '' : 'dim' },
+      title, hint,
+      el('div', { className: 'table-wrap' }, info),
+      actions,
+      el('div', { className: 'form-title', textContent: 'Recent deliveries' }),
+      el('div', { className: 'table-wrap' }, dTable)));
+  }
+}
+
+function prettyJson(s) {
+  try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
+}
+
+function syncWhForm() {
+  const f = $('#wh-form').elements;
+  const auth = f.namedItem('auth').value;
+  $('#wh-form [data-hdr]').hidden = auth === 'url';
+  const hdr = f.namedItem('headerName');
+  if (!hdr.value || ['X-Webhook-Secret', 'X-Signature'].includes(hdr.value)) hdr.value = auth === 'hmac' ? 'X-Signature' : 'X-Webhook-Secret';
+  $('#wh-auth-hint').textContent = {
+    url: 'The secret is part of the URL – just paste the URL into your provider. Simplest, but the URL itself must be kept private.',
+    header: 'Your provider sends the secret in this header on every call (a "Bearer " prefix is accepted).',
+    hmac: 'Your provider signs the request body with the secret (HMAC-SHA256, hex or base64, optional "sha256=" prefix). Use the signing secret your provider gives you.',
+  }[auth];
+}
+$('#wh-form').elements.namedItem('auth').addEventListener('change', syncWhForm);
+
+function openWhEditor(w) {
+  const form = $('#wh-form');
+  form.reset();
+  const f = form.elements;
+  const d = whData.defaults;
+  f.namedItem('id').value = w?.id || '';
+  f.namedItem('name').value = w?.name || '';
+  f.namedItem('enabled').checked = w ? w.enabled : true;
+  f.namedItem('nFailed').checked = w ? w.notify.failed : true;
+  f.namedItem('nPending').checked = w ? w.notify.pending : true;
+  f.namedItem('nSuccess').checked = w ? w.notify.success : true;
+  f.namedItem('chatIds').value = w?.chatIds || '';
+  f.namedItem('feedStreaks').checked = w ? w.feedStreaks : true;
+  f.namedItem('auth').value = w?.auth || 'url';
+  f.namedItem('headerName').value = w?.headerName || '';
+  f.namedItem('secret').value = '';
+  f.namedItem('secret').placeholder = w ? 'leave blank to keep the current secret' : 'leave blank to generate one';
+  f.namedItem('sFailed').value = w?.statuses.failed ?? d.failed;
+  f.namedItem('sPending').value = w?.statuses.pending ?? d.pending;
+  f.namedItem('sSuccess').value = w?.statuses.success ?? d.success;
+  $('#wh-form-title').textContent = w ? `Edit webhook “${w.name}”` : 'New webhook';
+  syncWhForm();
+  $('#wh-editor').hidden = false;
+  $('#wh-editor').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+$('#new-wh').onclick = () => openWhEditor(null);
+$('#wh-form [data-cancel]').onclick = () => ($('#wh-editor').hidden = true);
+
+$('#wh-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const f = ev.target.elements;
+  const v = (k) => f.namedItem(k).value.trim();
+  const c = (k) => f.namedItem(k).checked;
+  const body = {
+    name: v('name'), enabled: c('enabled'),
+    notify: { failed: c('nFailed'), pending: c('nPending'), success: c('nSuccess') },
+    chatIds: v('chatIds'), feedStreaks: c('feedStreaks'),
+    auth: v('auth'), headerName: v('headerName'), secret: v('secret'),
+    statuses: { failed: v('sFailed'), pending: v('sPending'), success: v('sSuccess') },
+  };
+  if (v('id')) body.id = v('id');
+  run(ev.target.querySelector('button.primary'), async () => {
+    await api('POST', '/api/webhooks', body);
+    $('#wh-editor').hidden = true;
+  }, 'Webhook saved').then(loadWebhooks);
+});
+
+setInterval(() => { if (!$('#tab-webhooks').hidden && $('#wh-editor').hidden) loadWebhooks(); }, 15000);
 
 // --- commands ---
 function toggleButton(on, onClick, locked) {
