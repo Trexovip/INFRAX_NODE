@@ -37,6 +37,8 @@ const DEFAULT_WEBHOOK_STATUSES = {
   success: 'SUCCESS,SUCCESSFUL,COMPLETED,SETTLED',
 };
 const newSecret = () => crypto.randomBytes(24).toString('hex');
+// webhooks saved by older versions lack some fields
+const withWebhookDefaults = (w) => ({ fnId: 'transactions', secretSource: 'own', streak: { failed: 5, pending: 5 }, ...w });
 
 const emptyKey = () => ({ key: '', secret: '', keyHeader: 'x-trexo-key', secretHeader: 'x-trexo-secret' });
 const pickKey = (c) => ({ key: c.key || '', secret: c.secret || '', keyHeader: c.keyHeader ?? 'x-trexo-key', secretHeader: c.secretHeader ?? 'x-trexo-secret' });
@@ -277,6 +279,7 @@ function createConfigStore({ file, env, writeJson }) {
       const fn = findFn(id);
       if (fn.builtin) throw new Error('Built-in functions cannot be deleted (you can disable them)');
       config.functions = config.functions.filter((f) => f.id !== id);
+      config.webhooks = (config.webhooks || []).filter((w) => (w.fnId || 'transactions') !== id);
       save();
     },
 
@@ -330,8 +333,19 @@ function createConfigStore({ file, env, writeJson }) {
     },
 
     // --- transaction webhooks ---
-    webhooks: () => config.webhooks || [],
-    webhook: (id) => (config.webhooks || []).find((w) => w.id === id) || null,
+    // older webhooks had no function – they belong to Transaction failures
+    webhooks: () => (config.webhooks || []).map(withWebhookDefaults),
+    webhook: (id) => {
+      const w = (config.webhooks || []).find((x) => x.id === id);
+      return w ? withWebhookDefaults(w) : null;
+    },
+    // the secret a webhook is verified with
+    webhookSecret(w) {
+      const fn = config.functions.find((f) => f.id === w.fnId);
+      if (w.secretSource === 'master_secret') return fn?.master?.secret || '';
+      if (w.secretSource === 'master_key') return fn?.master?.key || '';
+      return w.secret;
+    },
     defaultWebhookStatuses: () => ({ ...DEFAULT_WEBHOOK_STATUSES }),
 
     upsertWebhook(data) {
@@ -340,9 +354,18 @@ function createConfigStore({ file, env, writeJson }) {
       if (data.id && !existing) throw new Error('Webhook not found');
       const name = text(data.name, 60, 'Name');
       if (!name) throw new Error('Name is required');
-      const auth = ['url', 'header', 'hmac'].includes(data.auth) ? data.auth : 'url';
+      // a webhook belongs to a function (by default the built-in Transaction failures)
+      const fnId = String(data.fnId || existing?.fnId || 'transactions');
+      const fn = findFn(fnId);
+      // how deliveries are checked: none, secret in URL, secret header, HMAC signature
+      const auth = ['none', 'url', 'header', 'hmac'].includes(data.auth) ? data.auth : 'none';
+      const usesHeader = auth === 'header' || auth === 'hmac';
       const headerName = header(data.headerName || (auth === 'hmac' ? 'X-Signature' : 'X-Webhook-Secret'), '', 'Header name');
-      if (auth !== 'url' && !headerName) throw new Error('Header name is required');
+      if (usesHeader && !headerName) throw new Error('Header name is required');
+      // where the secret comes from: this webhook's own secret, or the function's master key/secret
+      const secretSource = usesHeader && ['master_secret', 'master_key'].includes(data.secretSource) ? data.secretSource : 'own';
+      if (secretSource === 'master_secret' && !fn.master?.secret) throw new Error(`“${fn.name}” has no master secret set`);
+      if (secretSource === 'master_key' && !fn.master?.key) throw new Error(`“${fn.name}” has no master key set`);
       const secret = text(data.secret, Infinity, 'Secret') || existing?.secret || newSecret();
       if (secret.length < 8) throw new Error('Secret must be at least 8 characters');
       if (auth === 'url' && !/^[A-Za-z0-9_-]+$/.test(secret)) throw new Error('A secret used in the URL may only contain letters, digits, _ and -');
@@ -354,13 +377,20 @@ function createConfigStore({ file, env, writeJson }) {
       for (const c of chatIds) if (!/^(-?\d{1,20}|@[A-Za-z0-9_]{5,32})$/.test(c)) throw new Error(`Invalid chat ID "${c}"`);
 
       const entry = {
-        id: existing?.id || newId(),
-        name, auth, headerName, secret,
+        // long random ID – with no secret, the URL itself is the only thing protecting the webhook
+        id: existing?.id || crypto.randomBytes(12).toString('hex'),
+        fnId, name, auth, headerName, secret, secretSource,
         enabled: data.enabled !== false,
-        notify: { failed: data.notify?.failed !== false, pending: data.notify?.pending === true, success: data.notify?.success === true },
+        // one message per transaction (optional)
+        notify: { failed: data.notify?.failed === true, pending: data.notify?.pending === true, success: data.notify?.success === true },
+        // one alert when a customer has N failed / N pending transactions in a row (0 = off)
+        streak: {
+          failed: num(data.streak?.failed ?? 5, 'Failed in a row', { min: 0, max: 50, int: true }),
+          pending: num(data.streak?.pending ?? 5, 'Pending in a row', { min: 0, max: 50, int: true }),
+        },
         statuses,
         chatIds: chatIds.join(','),
-        feedStreaks: data.feedStreaks !== false,
+        feedStreaks: data.feedStreaks === true,
         createdAt: existing?.createdAt || Date.now(),
       };
       if (existing) Object.assign(existing, entry);
