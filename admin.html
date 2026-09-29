@@ -1,0 +1,942 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bot Admin</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1b1f24; --muted: #667085; --border: #e3e6ea;
+    --accent: #2563eb; --accent-text: #fff; --danger: #c62828; --ok: #1b7f3b; --row: #fafbfc;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418; --card: #1a1e24; --text: #e6e8eb; --muted: #98a2b3; --border: #2b3139;
+      --accent: #4c8dff; --accent-text: #fff; --danger: #ff6b6b; --ok: #4ade80; --row: #161a1f;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+  h2 { font-size: 15px; margin: 0 0 2px; display: flex; gap: 8px; align-items: center; }
+  .count { background: var(--row); border: 1px solid var(--border); border-radius: 99px; padding: 0 8px; font-size: 12px; color: var(--muted); font-weight: 500; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  form { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  input { flex: 1 1 180px; min-width: 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button { padding: 7px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; }
+  button:hover { border-color: var(--muted); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.danger { color: var(--danger); }
+  button.confirm { background: var(--danger); border-color: var(--danger); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 8px; border-top: 1px solid var(--border); vertical-align: middle; }
+  th { font-size: 12px; color: var(--muted); font-weight: 500; border-top: 0; }
+  td.actions { text-align: right; white-space: nowrap; }
+  td.actions button + button { margin-left: 6px; }
+  code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); padding: 14px 8px; border-top: 1px solid var(--border); }
+  #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 8px; max-width: calc(100% - 32px); }
+  #toast.error { background: var(--danger); color: #fff; }
+
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; justify-content: space-between; margin-bottom: 20px; }
+  header .sub { margin: 0; }
+  .who { display: flex; gap: 10px; align-items: center; color: var(--muted); }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+  .tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 14px; color: var(--muted); }
+  .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 500; }
+
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+  .toolbar input { flex: 1 1 220px; }
+  select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+  .toolbar label { display: flex; gap: 6px; align-items: center; color: var(--muted); white-space: nowrap; }
+  .toolbar label input { flex: none; margin: 0; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .chips button { padding: 3px 10px; border-radius: 99px; font-size: 12px; }
+  .chips button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  #logs { font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 65vh; overflow: auto;
+          border: 1px solid var(--border); border-radius: 8px; background: var(--row); }
+  .log { display: grid; grid-template-columns: max-content 52px 1fr; gap: 10px; padding: 5px 10px; border-top: 1px solid var(--border); }
+  .log:first-child { border-top: 0; }
+  .log time { color: var(--muted); white-space: nowrap; }
+  .log .lvl { font-weight: 600; text-transform: uppercase; font-size: 11px; padding-top: 1px; }
+  .log.info .lvl { color: var(--muted); }
+  .log.warn .lvl { color: #b26a00; }
+  .log.error .lvl { color: var(--danger); }
+  .log.error { background: color-mix(in srgb, var(--danger) 7%, transparent); }
+  .log .msg { white-space: pre-wrap; word-break: break-word; }
+  @media (max-width: 560px) { .log { grid-template-columns: 1fr; gap: 0; } }
+
+  .tag { display: inline-block; font-size: 11px; font-weight: 500; padding: 0 7px; border-radius: 99px; border: 1px solid var(--border); color: var(--muted); margin-right: 4px; white-space: nowrap; }
+  .tag.low { color: var(--danger); border-color: currentColor; }
+  .tag.blocked { color: #b26a00; border-color: currentColor; }
+  .tag.ok { color: var(--ok); border-color: currentColor; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.dim td { opacity: .6; }
+  .setting { display: flex; gap: 10px; align-items: flex-start; }
+  .setting input { flex: none; width: 18px; height: 18px; margin: 2px 0 0; }
+  .setting b { display: block; }
+  .row-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 14px; }
+
+  form.stack { display: block; }
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 12px; margin-bottom: 12px; }
+  .fields label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  .fields label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-size: 14px; padding-top: 18px; }
+  .fields input, .fields select { flex: none; width: 100%; }
+  .fields label.check input { width: auto; }
+  input[type="time"], input[type="number"] { flex: none; }
+  .form-title { font-size: 13px; font-weight: 600; margin: 18px 0 10px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .url { display: inline-block; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+  .dot.on { background: var(--ok); }
+  .dot.off { background: var(--danger); }
+  .inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .inline input[type="number"] { width: 80px; }
+  .warn-box { background: color-mix(in srgb, #b26a00 10%, transparent); border: 1px solid color-mix(in srgb, #b26a00 35%, transparent); border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Monitoring Bot · Admin</h1>
+      <p class="sub">Changes apply immediately – no restart needed.</p>
+    </div>
+    <div class="who">Signed in as <b id="me">…</b> <button type="button" id="logout">Sign out</button></div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button type="button" role="tab" data-tab="access" aria-selected="true">Access</button>
+    <button type="button" role="tab" data-tab="accounts" aria-selected="false">Accounts</button>
+    <button type="button" role="tab" data-tab="chats" aria-selected="false">Chats</button>
+    <button type="button" role="tab" data-tab="settings" aria-selected="false">Settings</button>
+    <button type="button" role="tab" data-tab="logs" aria-selected="false">Logs</button>
+  </nav>
+
+  <div id="tab-access">
+  <section>
+    <h2>Alert chats <span class="count" id="alertChats-count">0</span></h2>
+    <p class="hint">Groups, channels or users that receive alerts. Members of these chats can also use bot commands. Send <code>/id</code> in the group to get its ID (groups start with <code>-</code>).</p>
+    <form data-list="alertChats">
+      <input name="id" placeholder="Chat ID, e.g. -1001234567890" required autocomplete="off">
+      <input name="label" placeholder="Label (optional – auto-filled from Telegram)" autocomplete="off">
+      <button class="primary">Add chat</button>
+    </form>
+    <div class="table-wrap"><table id="alertChats"></table></div>
+  </section>
+
+  <section>
+    <h2>Allowed users <span class="count" id="allowedUsers-count">0</span></h2>
+    <p class="hint">Users who can run bot commands from any chat (e.g. in a private DM with the bot).</p>
+    <form data-list="allowedUsers">
+      <input name="id" placeholder="User ID, e.g. 123456789" required autocomplete="off" inputmode="numeric">
+      <input name="label" placeholder="Label (optional)" autocomplete="off">
+      <button class="primary">Add user</button>
+    </form>
+    <div class="table-wrap"><table id="allowedUsers"></table></div>
+  </section>
+
+  <section>
+    <h2>Access requests <span class="count" id="requests-count">0</span></h2>
+    <p class="hint">People who messaged the bot without access. Approve them with one click.</p>
+    <div class="table-wrap"><table id="requests"></table></div>
+  </section>
+  </div>
+
+  <div id="tab-accounts" hidden>
+  <section>
+    <h2>Balance check settings</h2>
+    <p class="hint" id="acct-last">Last balance check: …</p>
+    <label class="setting">
+      <input type="checkbox" id="skip-inactive">
+      <span><b>Skip inactive accounts</b><span class="muted">Accounts with <code>is_active = false</code> are left out of balance checks and low-balance alerts.</span></span>
+    </label>
+    <div class="row-actions">
+      <button type="button" id="run-check">Run balance check now</button>
+      <span class="muted">Changes apply on the next check (every few minutes), or run one now.</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Blocked accounts <span class="count" id="blocked-count">0</span></h2>
+    <p class="hint">Blocked accounts get no notifications (low balance or transaction failures) and are left out of balance checks.</p>
+    <form id="block-form">
+      <input name="account" placeholder="Account number or account ID" required autocomplete="off">
+      <input name="label" placeholder="Label (optional)" autocomplete="off">
+      <button class="primary">Block account</button>
+    </form>
+    <div class="table-wrap"><table id="blocked"></table></div>
+  </section>
+
+  <section>
+    <h2>All accounts <span class="count" id="accounts-count">0</span></h2>
+    <p class="hint">Every account from the last balance check, including inactive and blocked ones.</p>
+    <div class="toolbar">
+      <input id="acct-q" type="search" placeholder="Search name, bank or account number…" autocomplete="off">
+      <select id="acct-filter" aria-label="Show">
+        <option value="">All accounts</option>
+        <option value="tracked">Tracked</option>
+        <option value="low">Low balance</option>
+        <option value="inactive">Inactive</option>
+        <option value="blocked">Blocked</option>
+      </select>
+    </div>
+    <div class="table-wrap"><table id="accounts"></table></div>
+  </section>
+  </div>
+
+  <div id="tab-chats" hidden>
+  <section>
+    <h2>Auto-clear</h2>
+    <p class="hint">Automatically delete the bot's messages (alerts, replies) and the commands it handled. Telegram only lets bots delete messages less than 48 hours old.</p>
+    <form id="autoclear-form" class="stack">
+      <label class="setting" style="margin-bottom:14px">
+        <input type="checkbox" name="enabled">
+        <span><b>Auto-clear chats</b><span class="muted" id="ac-last"></span></span>
+      </label>
+      <div class="fields">
+        <label>When
+          <select name="mode">
+            <option value="rolling">Continuously (checks every 10 minutes)</option>
+            <option value="daily">Once a day at a set time</option>
+          </select>
+        </label>
+        <label id="ac-time-wrap">Time (<span id="ac-tz"></span>)
+          <input type="time" name="time" required>
+        </label>
+        <label>Delete messages older than (hours)
+          <input type="number" name="olderThanHours" min="0" max="47" step="1" required>
+        </label>
+      </div>
+      <p class="hint" id="ac-summary"></p>
+      <button class="primary">Save auto-clear</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>Chats <span class="count" id="chats-count">0</span></h2>
+    <p class="hint">Clear now deletes every bot message in the chat that Telegram still allows (under 48 hours). In groups the bot must be an admin with “Delete messages” permission to delete other people's commands.</p>
+    <div class="row-actions" style="margin:0 0 12px" id="clear-all-wrap"></div>
+    <div class="table-wrap"><table id="chats"></table></div>
+  </section>
+  </div>
+
+  <div id="tab-settings" hidden>
+  <section>
+    <h2>Telegram bot</h2>
+    <p class="hint" id="bot-status">…</p>
+    <form id="token-form">
+      <input name="token" type="password" placeholder="New bot token from @BotFather (123456:ABC…)" autocomplete="off" required>
+      <button class="primary">Save token</button>
+    </form>
+    <p class="hint" style="margin:0">The token is checked with Telegram before it replaces the current one. The bot reconnects immediately.</p>
+  </section>
+
+  <section>
+    <h2>API keys <span class="count" id="creds-count">0</span></h2>
+    <p class="hint">Key/secret sets used to call your APIs. Add as many as you need, then pick which one each API uses below. Saved values are never shown in full.</p>
+    <div class="table-wrap"><table id="creds"></table></div>
+    <form id="cred-form" class="stack">
+      <div class="form-title" id="cred-form-title">Add API key</div>
+      <input type="hidden" name="id">
+      <div class="fields">
+        <label>Name<input name="name" placeholder="e.g. Trexo – Merchant A" required autocomplete="off"></label>
+        <label>Key<input name="key" type="password" autocomplete="off"></label>
+        <label>Secret<input name="secret" type="password" autocomplete="off"></label>
+        <label>Key header<input name="keyHeader" value="x-trexo-key" autocomplete="off"></label>
+        <label>Secret header<input name="secretHeader" value="x-trexo-secret" autocomplete="off"></label>
+      </div>
+      <div class="inline">
+        <button class="primary">Save API key</button>
+        <button type="button" data-cancel hidden>Cancel edit</button>
+      </div>
+    </form>
+  </section>
+
+  <section>
+    <h2>APIs <span class="count" id="eps-count">0</span></h2>
+    <p class="hint">Balance APIs are checked every few minutes for low balances; transaction APIs for failure streaks. You can add several of each – results are combined.</p>
+    <div class="table-wrap"><table id="eps"></table></div>
+    <form id="ep-form" class="stack">
+      <div class="form-title" id="ep-form-title">Add API</div>
+      <input type="hidden" name="id">
+      <div class="fields">
+        <label>Name<input name="name" placeholder="e.g. Merchant A balances" required autocomplete="off"></label>
+        <label>Used for
+          <select name="type">
+            <option value="balance">Balance check</option>
+            <option value="transactions">Transactions (failures)</option>
+          </select>
+        </label>
+        <label>API key to use<select name="credentialId"></select></label>
+        <label style="grid-column: 1 / -1">URL<input name="url" type="url" placeholder="https://api.example.com/api/v1/accounts" required autocomplete="off"></label>
+        <label data-since>“Since” query parameter<input name="sinceParam" placeholder="from" autocomplete="off"></label>
+        <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+      </div>
+      <div class="inline">
+        <button class="primary">Save API</button>
+        <button type="button" data-cancel hidden>Cancel edit</button>
+      </div>
+    </form>
+  </section>
+  </div>
+
+  <div id="tab-logs" hidden>
+  <section>
+    <div class="toolbar">
+      <input id="log-q" type="search" placeholder="Search logs…" autocomplete="off">
+      <select id="log-level" aria-label="Level">
+        <option value="">All levels</option>
+        <option value="info">Info</option>
+        <option value="warn">Warnings</option>
+        <option value="error">Errors</option>
+      </select>
+      <label><input type="checkbox" id="log-live" checked> Live</label>
+    </div>
+    <div class="chips" id="log-chips">
+      <button type="button" data-q="" aria-pressed="true">Everything</button>
+      <button type="button" data-q="[ALERT]" aria-pressed="false">Alerts sent</button>
+      <button type="button" data-q="[CMD]" aria-pressed="false">Bot commands</button>
+      <button type="button" data-q="[DENIED]" aria-pressed="false">Denied access</button>
+      <button type="button" data-q="[ADMIN]" aria-pressed="false">Admin actions</button>
+      <button type="button" data-q="[CLEAR]" aria-pressed="false">Chat clears</button>
+    </div>
+    <div id="logs"></div>
+    <p class="hint" id="log-info" style="margin:10px 0 0"></p>
+  </section>
+  </div>
+</main>
+<div id="toast" hidden></div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+const el = (tag, props = {}, ...children) => {
+  const n = Object.assign(document.createElement(tag), props);
+  n.append(...children);
+  return n;
+};
+const fmt = (ts) => ts ? new Date(ts).toLocaleString() : '';
+
+let toastTimer;
+function toast(msg, isError) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = isError ? 'error' : '';
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (t.hidden = true), 3500);
+}
+
+async function api(method, url, body) {
+  const res = await fetch(url, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401) { location.href = '/login'; throw new Error('Session expired'); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+async function run(btn, fn, okMsg) {
+  btn.disabled = true;
+  try { await fn(); if (okMsg) toast(okMsg); await load(); }
+  catch (e) { toast(e.message, true); }
+  finally { btn.disabled = false; }
+}
+
+// Two-step destructive button: first click arms, second click confirms
+function confirmButton(label, onConfirm, okMsg, after) {
+  const b = el('button', { className: 'danger', textContent: label, type: 'button' });
+  let armed = false, timer;
+  const reset = () => { armed = false; b.textContent = label; b.className = 'danger'; };
+  b.onclick = () => {
+    if (!armed) {
+      armed = true; b.textContent = 'Confirm?'; b.className = 'confirm';
+      timer = setTimeout(reset, 3000);
+      return;
+    }
+    clearTimeout(timer);
+    reset();
+    run(b, onConfirm, okMsg).then(after);
+  };
+  return b;
+}
+const removeButton = (onConfirm) => confirmButton('Remove', onConfirm, 'Removed');
+
+function renderList(name, entries, extraButton) {
+  const table = $('#' + name);
+  $('#' + name + '-count').textContent = entries.length;
+  table.replaceChildren();
+  if (!entries.length) {
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 4, textContent: 'None yet.' })));
+    return;
+  }
+  table.append(el('tr', {},
+    el('th', { textContent: 'ID' }), el('th', { textContent: 'Label' }),
+    el('th', { textContent: 'Added' }), el('th')));
+  for (const e of entries) {
+    const actions = el('td', { className: 'actions' });
+    if (extraButton) actions.append(extraButton(e));
+    actions.append(removeButton(() => api('DELETE', `/api/lists/${name}/${encodeURIComponent(e.id)}`)));
+    table.append(el('tr', {},
+      el('td', {}, el('code', { textContent: e.id })),
+      el('td', { textContent: e.label || '—', className: e.label ? '' : 'muted' }),
+      el('td', { textContent: fmt(e.addedAt), className: 'muted' }),
+      actions));
+  }
+}
+
+function renderRequests(requests, access) {
+  const rows = Object.values(requests).sort((a, b) => b.at - a.at);
+  const table = $('#requests');
+  $('#requests-count').textContent = rows.length;
+  table.replaceChildren();
+  if (!rows.length) {
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 4, textContent: 'No pending requests.' })));
+    return;
+  }
+  const chatIds = new Set(access.alertChats.map((c) => c.id));
+  table.append(el('tr', {},
+    el('th', { textContent: 'User' }), el('th', { textContent: 'From chat' }),
+    el('th', { textContent: 'When' }), el('th')));
+  for (const r of rows) {
+    const who = [r.name, r.username && '@' + r.username].filter(Boolean).join(' · ');
+    const chat = r.chatType === 'private' ? 'Private DM' : `${r.chatTitle || r.chatType} (${r.chatId})`;
+    const actions = el('td', { className: 'actions' });
+
+    const allow = el('button', { className: 'primary', textContent: 'Allow user', type: 'button' });
+    allow.onclick = () => run(allow, () => api('POST', '/api/lists/allowedUsers', { id: r.userId, label: who }), 'User allowed');
+    actions.append(allow);
+
+    if (r.chatType !== 'private' && !chatIds.has(r.chatId)) {
+      const addChat = el('button', { textContent: 'Add chat', type: 'button' });
+      addChat.onclick = () => run(addChat, () => api('POST', '/api/lists/alertChats', { id: r.chatId, label: r.chatTitle }), 'Chat added');
+      actions.append(addChat);
+    }
+
+    const dismiss = el('button', { textContent: 'Dismiss', type: 'button' });
+    dismiss.onclick = () => run(dismiss, () => api('DELETE', `/api/requests/${encodeURIComponent(r.userId)}`));
+    actions.append(dismiss);
+
+    table.append(el('tr', {},
+      el('td', {}, el('div', { textContent: who || '—' }), el('code', { className: 'muted', textContent: r.userId })),
+      el('td', { textContent: chat }),
+      el('td', { textContent: fmt(r.at), className: 'muted' }),
+      actions));
+  }
+}
+
+async function load() {
+  try {
+    const a = await api('GET', '/api/access');
+    renderList('alertChats', a.alertChats, (e) => {
+      const b = el('button', { textContent: 'Test', type: 'button' });
+      b.onclick = () => run(b, () => api('POST', `/api/test/${encodeURIComponent(e.id)}`), 'Test message sent');
+      return b;
+    });
+    renderList('allowedUsers', a.allowedUsers);
+    renderRequests(a.requests || {}, a);
+  } catch (e) {
+    toast('Failed to load: ' + e.message, true);
+  }
+}
+
+document.querySelectorAll('form[data-list]').forEach((form) => {
+  form.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    const btn = form.querySelector('button');
+    const f = form.elements;
+    const body = { id: f.namedItem('id').value.trim(), label: f.namedItem('label').value.trim() };
+    run(btn, async () => { await api('POST', `/api/lists/${form.dataset.list}`, body); form.reset(); }, 'Added');
+  });
+});
+
+// --- session ---
+api('GET', '/api/me').then((m) => ($('#me').textContent = m.user)).catch(() => {});
+$('#logout').onclick = async () => {
+  try { await api('POST', '/api/logout'); } catch {}
+  location.href = '/login';
+};
+
+// --- tabs ---
+function showTab(name) {
+  document.querySelectorAll('[data-tab]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === name)));
+  for (const t of TABS) $('#tab-' + t).hidden = name !== t;
+  history.replaceState(null, '', name === 'access' ? location.pathname : '#' + name);
+  if (name === 'logs') loadLogs(true);
+  if (name === 'accounts') loadAccounts();
+  if (name === 'chats') loadChats();
+  if (name === 'settings') loadSettings();
+}
+const TABS = ['access', 'accounts', 'chats', 'settings', 'logs'];
+
+// --- chats ---
+let chatData = null;
+
+async function loadChats() {
+  try { chatData = await api('GET', '/api/chats'); }
+  catch (e) { return toast('Failed to load chats: ' + e.message, true); }
+  const ac = chatData.autoClear || {};
+  const f = $('#autoclear-form').elements;
+  // don't overwrite what the admin is typing
+  if (!$('#autoclear-form').contains(document.activeElement)) {
+    f.namedItem('enabled').checked = !!ac.enabled;
+    f.namedItem('mode').value = ac.mode || 'rolling';
+    f.namedItem('time').value = ac.time || '03:00';
+    f.namedItem('olderThanHours').value = ac.olderThanHours ?? 24;
+  }
+  $('#ac-tz').textContent = chatData.timezone;
+  $('#ac-last').textContent = chatData.lastAutoClear ? `Last run: ${fmt(chatData.lastAutoClear)}` : 'Not run yet';
+  syncAutoClearForm();
+  renderChats();
+}
+
+function syncAutoClearForm() {
+  const f = $('#autoclear-form').elements;
+  const daily = f.namedItem('mode').value === 'daily';
+  $('#ac-time-wrap').hidden = !daily;
+  f.namedItem('olderThanHours').min = daily ? 0 : 1;
+  const h = f.namedItem('olderThanHours').value;
+  $('#ac-summary').textContent = !f.namedItem('enabled').checked ? 'Auto-clear is off.'
+    : daily
+      ? `Every day at ${f.namedItem('time').value || '—'}, delete bot messages older than ${h} hour(s)${h === '0' ? ' (everything)' : ''}.`
+      : `Every 10 minutes, delete bot messages older than ${h} hour(s).`;
+}
+$('#autoclear-form').addEventListener('input', syncAutoClearForm);
+
+$('#autoclear-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const f = ev.target.elements;
+  const body = {
+    enabled: f.namedItem('enabled').checked,
+    mode: f.namedItem('mode').value,
+    time: f.namedItem('time').value,
+    olderThanHours: Number(f.namedItem('olderThanHours').value),
+  };
+  run(ev.target.querySelector('button.primary'), () => api('POST', '/api/chats/auto-clear', body), 'Auto-clear saved').then(loadChats);
+});
+
+const clearResult = (r) => `Deleted ${r.deleted} message(s)` + (r.failed ? ` · ${r.failed} could not be deleted` : '');
+
+function renderChats() {
+  const rows = (chatData?.chats || []).sort((a, b) => b.messages - a.messages);
+  $('#chats-count').textContent = rows.length;
+
+  const wrap = $('#clear-all-wrap');
+  wrap.replaceChildren(confirmButton('Clear all chats', async () => {
+    const r = await api('POST', '/api/chats/clear', {});
+    toast(clearResult(r));
+  }, null, loadChats));
+
+  const table = $('#chats');
+  table.replaceChildren();
+  if (!rows.length) {
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 5, textContent: 'No chats yet.' })));
+    return;
+  }
+  table.append(el('tr', {},
+    el('th', { textContent: 'Chat' }), el('th', { textContent: 'Messages', className: 'num' }),
+    el('th', { textContent: 'Oldest' }), el('th', { textContent: 'Newest' }), el('th')));
+  for (const c of rows) {
+    const clear = confirmButton('Clear now', async () => {
+      const r = await api('POST', '/api/chats/clear', { chatId: c.chatId });
+      toast(clearResult(r));
+    }, null, loadChats);
+    clear.disabled = !c.messages;
+    table.append(el('tr', {},
+      el('td', {},
+        el('div', { textContent: c.label || (c.isAlertChat ? 'Alert chat' : 'Chat') }),
+        el('code', { className: 'muted', textContent: c.chatId })),
+      el('td', { className: 'num', textContent: c.deletable === c.messages ? c.messages : `${c.messages} (${c.deletable} deletable)` }),
+      el('td', { className: 'muted', textContent: fmt(c.oldest) || '—' }),
+      el('td', { className: 'muted', textContent: fmt(c.newest) || '—' }),
+      el('td', { className: 'actions' }, clear)));
+  }
+}
+
+// --- settings ---
+let settingsData = null;
+
+async function loadSettings() {
+  try { settingsData = await api('GET', '/api/settings'); }
+  catch (e) { return toast('Failed to load settings: ' + e.message, true); }
+  const s = settingsData;
+
+  const status = $('#bot-status');
+  status.replaceChildren();
+  if (s.bot) {
+    status.append(el('span', { className: 'dot on' }), `Connected as @${s.bot.username}`,
+      el('span', { className: 'muted', textContent: ` · token ${s.telegram.tokenHint}` }));
+  } else {
+    status.append(el('span', { className: 'dot off' }),
+      s.telegram.configured ? `Not connected – token ${s.telegram.tokenHint} was rejected or Telegram is unreachable (see Logs)` : 'No bot token set – the bot is not running');
+  }
+
+  renderCreds();
+  renderEndpoints();
+}
+
+function renderCreds() {
+  const rows = settingsData.credentials;
+  $('#creds-count').textContent = rows.length;
+  const table = $('#creds');
+  table.replaceChildren();
+  if (!rows.length) {
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 5, textContent: 'No API keys yet.' })));
+  } else {
+    table.append(el('tr', {},
+      el('th', { textContent: 'Name' }), el('th', { textContent: 'Key' }), el('th', { textContent: 'Secret' }),
+      el('th', { textContent: 'Used by' }), el('th')));
+    for (const c of rows) {
+      const edit = el('button', { type: 'button', textContent: 'Edit' });
+      edit.onclick = () => editCred(c);
+      const del = confirmButton('Delete', () => api('DELETE', `/api/settings/credentials/${encodeURIComponent(c.id)}`), 'API key deleted', loadSettings);
+      table.append(el('tr', {},
+        el('td', {}, el('div', { textContent: c.name }),
+          el('span', { className: 'muted', textContent: [c.keyHeader, c.secretHeader].filter(Boolean).join(' · ') })),
+        el('td', {}, el('code', { textContent: c.keyHint || '—' })),
+        el('td', {}, el('code', { textContent: c.secretHint || '—' })),
+        el('td', { textContent: c.usedBy.join(', ') || '—', className: c.usedBy.length ? '' : 'muted' }),
+        el('td', { className: 'actions' }, edit, del)));
+    }
+  }
+
+  // API key picker in the endpoint form
+  const sel = $('#ep-form').elements.namedItem('credentialId');
+  const current = sel.value;
+  sel.replaceChildren(el('option', { value: '', textContent: 'None (no auth headers)' }),
+    ...rows.map((c) => el('option', { value: c.id, textContent: c.name })));
+  sel.value = rows.some((c) => c.id === current) ? current : (rows[0]?.id || '');
+}
+
+function resetForm(form, title, titleText) {
+  form.reset();
+  form.elements.namedItem('id').value = '';
+  $(title).textContent = titleText;
+  form.querySelector('[data-cancel]').hidden = true;
+}
+
+function editCred(c) {
+  const form = $('#cred-form');
+  const f = form.elements;
+  f.namedItem('id').value = c.id;
+  f.namedItem('name').value = c.name;
+  f.namedItem('key').value = '';
+  f.namedItem('secret').value = '';
+  f.namedItem('key').placeholder = `${c.keyHint || 'not set'} – leave blank to keep`;
+  f.namedItem('secret').placeholder = `${c.secretHint || 'not set'} – leave blank to keep`;
+  f.namedItem('keyHeader').value = c.keyHeader;
+  f.namedItem('secretHeader').value = c.secretHeader;
+  $('#cred-form-title').textContent = `Edit API key “${c.name}”`;
+  form.querySelector('[data-cancel]').hidden = false;
+  form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+$('#cred-form [data-cancel]').onclick = () => {
+  const f = $('#cred-form').elements;
+  f.namedItem('key').placeholder = f.namedItem('secret').placeholder = '';
+  resetForm($('#cred-form'), '#cred-form-title', 'Add API key');
+};
+
+$('#cred-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const form = ev.target;
+  const f = form.elements;
+  const body = Object.fromEntries(['id', 'name', 'key', 'secret', 'keyHeader', 'secretHeader'].map((k) => [k, f.namedItem(k).value.trim()]));
+  if (!body.id) delete body.id;
+  run(form.querySelector('button.primary'), async () => {
+    await api('POST', '/api/settings/credentials', body);
+    f.namedItem('key').placeholder = f.namedItem('secret').placeholder = '';
+    resetForm(form, '#cred-form-title', 'Add API key');
+  }, 'API key saved').then(loadSettings);
+});
+
+function renderEndpoints() {
+  const rows = settingsData.endpoints;
+  const credName = (id) => settingsData.credentials.find((c) => c.id === id)?.name;
+  $('#eps-count').textContent = rows.length;
+  const table = $('#eps');
+  table.replaceChildren();
+  if (!rows.length) {
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 5, textContent: 'No APIs yet – add a balance API and a transactions API below.' })));
+    return;
+  }
+  table.append(el('tr', {},
+    el('th', { textContent: 'Name' }), el('th', { textContent: 'Used for' }), el('th', { textContent: 'URL' }),
+    el('th', { textContent: 'API key' }), el('th')));
+  for (const e of rows) {
+    const test = el('button', { type: 'button', textContent: 'Test' });
+    test.onclick = async () => {
+      test.disabled = true;
+      try {
+        const r = await api('POST', `/api/settings/endpoints/${encodeURIComponent(e.id)}/test`);
+        toast(r.ok ? `✓ HTTP ${r.status} in ${r.ms} ms · ${r.items} item(s)${r.fields.length ? ' · fields: ' + r.fields.slice(0, 8).join(', ') : ''}` : `✗ ${r.error}`, !r.ok);
+      } catch (err) { toast(err.message, true); }
+      finally { test.disabled = false; }
+    };
+    const edit = el('button', { type: 'button', textContent: 'Edit' });
+    edit.onclick = () => editEndpoint(e);
+    const del = confirmButton('Delete', () => api('DELETE', `/api/settings/endpoints/${encodeURIComponent(e.id)}`), 'API deleted', loadSettings);
+    table.append(el('tr', { className: e.enabled ? '' : 'dim' },
+      el('td', {}, el('div', { textContent: e.name }), e.enabled ? '' : el('span', { className: 'tag', textContent: 'Disabled' })),
+      el('td', { textContent: e.type === 'balance' ? 'Balance check' : 'Transactions' }),
+      el('td', {}, el('code', { className: 'url', textContent: e.url, title: e.url })),
+      el('td', { textContent: credName(e.credentialId) || 'None', className: e.credentialId ? '' : 'muted' }),
+      el('td', { className: 'actions' }, test, edit, del)));
+  }
+}
+
+function syncEndpointForm() {
+  const f = $('#ep-form').elements;
+  $('#ep-form [data-since]').hidden = f.namedItem('type').value !== 'transactions';
+}
+$('#ep-form').elements.namedItem('type').addEventListener('change', syncEndpointForm);
+syncEndpointForm();
+
+function editEndpoint(e) {
+  const form = $('#ep-form');
+  const f = form.elements;
+  for (const k of ['id', 'name', 'type', 'url', 'credentialId', 'sinceParam']) f.namedItem(k).value = e[k] ?? '';
+  f.namedItem('enabled').checked = e.enabled;
+  $('#ep-form-title').textContent = `Edit API “${e.name}”`;
+  form.querySelector('[data-cancel]').hidden = false;
+  syncEndpointForm();
+  form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+$('#ep-form [data-cancel]').onclick = () => {
+  resetForm($('#ep-form'), '#ep-form-title', 'Add API');
+  renderCreds();
+  syncEndpointForm();
+};
+
+$('#ep-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const form = ev.target;
+  const f = form.elements;
+  const body = Object.fromEntries(['id', 'name', 'type', 'url', 'credentialId', 'sinceParam'].map((k) => [k, f.namedItem(k).value.trim()]));
+  body.enabled = f.namedItem('enabled').checked;
+  if (!body.id) delete body.id;
+  run(form.querySelector('button.primary'), async () => {
+    await api('POST', '/api/settings/endpoints', body);
+    resetForm(form, '#ep-form-title', 'Add API');
+  }, 'API saved').then(() => loadSettings().then(syncEndpointForm));
+});
+
+$('#token-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const form = ev.target;
+  const token = form.elements.namedItem('token').value.trim();
+  run(form.querySelector('button'), async () => {
+    const r = await api('POST', '/api/settings/bot-token', { token });
+    form.reset();
+    toast(`Bot connected as @${r.bot?.username}`);
+  }).then(loadSettings);
+});
+
+// --- accounts ---
+const inr = (n) => Number(n).toLocaleString('en-IN', { style: 'currency', currency: 'INR' });
+let acctData = { accounts: [], blocked: [], settings: {} };
+
+async function loadAccounts() {
+  try { acctData = await api('GET', '/api/accounts'); }
+  catch (e) { return toast('Failed to load accounts: ' + e.message, true); }
+  $('#skip-inactive').checked = acctData.settings?.skipInactive !== false;
+  $('#acct-last').textContent = 'Last balance check: ' + (acctData.lastCheck ? fmt(acctData.lastCheck) : 'never');
+  renderBlocked();
+  renderAccounts();
+}
+
+function renderBlocked() {
+  const rows = acctData.blocked || [];
+  const table = $('#blocked');
+  $('#blocked-count').textContent = rows.length;
+  table.replaceChildren();
+  if (!rows.length) {
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 5, textContent: 'No blocked accounts.' })));
+    return;
+  }
+  table.append(el('tr', {},
+    el('th', { textContent: 'A/c No' }), el('th', { textContent: 'Customer' }),
+    el('th', { textContent: 'Bank' }), el('th', { textContent: 'Blocked on' }), el('th')));
+  for (const b of rows) {
+    const unblock = el('button', { textContent: 'Unblock', type: 'button' });
+    unblock.onclick = () => run(unblock, () => api('DELETE', `/api/blocked/${encodeURIComponent(b.id)}`), 'Unblocked').then(loadAccounts);
+    table.append(el('tr', {},
+      el('td', {}, el('code', { textContent: b.accountNumber || b.id })),
+      el('td', { textContent: b.label || '—', className: b.label ? '' : 'muted' }),
+      el('td', { textContent: b.bankName || '—', className: b.bankName ? '' : 'muted' }),
+      el('td', { textContent: fmt(b.addedAt), className: 'muted' }),
+      el('td', { className: 'actions' }, unblock)));
+  }
+}
+
+function renderAccounts() {
+  const skipInactive = acctData.settings?.skipInactive !== false;
+  const q = $('#acct-q').value.trim().toLowerCase();
+  const filter = $('#acct-filter').value;
+  const tracked = (a) => !a.blocked && (a.isActive || !skipInactive);
+  const rows = (acctData.accounts || [])
+    .filter((a) => !q || [a.customerName, a.bankName, a.accountNumber, a.accountId].some((v) => String(v || '').toLowerCase().includes(q)))
+    .filter((a) => !filter ||
+      (filter === 'tracked' && tracked(a)) || (filter === 'low' && a.low && tracked(a)) ||
+      (filter === 'inactive' && !a.isActive) || (filter === 'blocked' && a.blocked))
+    .sort((a, b) => a.balance - b.balance);
+
+  const table = $('#accounts');
+  $('#accounts-count').textContent = (acctData.accounts || []).length;
+  table.replaceChildren();
+  if (!rows.length) {
+    const msg = acctData.accounts?.length ? 'No accounts match.' : 'No account data yet – run a balance check.';
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 6, textContent: msg })));
+    return;
+  }
+  table.append(el('tr', {},
+    el('th', { textContent: 'Customer' }), el('th', { textContent: 'Bank' }), el('th', { textContent: 'A/c No' }),
+    el('th', { textContent: 'Balance', className: 'num' }), el('th', { textContent: 'Status' }), el('th')));
+
+  for (const a of rows) {
+    const status = el('td');
+    if (a.blocked) status.append(el('span', { className: 'tag blocked', textContent: 'Blocked' }));
+    if (!a.isActive) status.append(el('span', { className: 'tag', textContent: skipInactive ? 'Inactive · skipped' : 'Inactive' }));
+    if (tracked(a)) status.append(el('span', { className: a.low ? 'tag low' : 'tag ok', textContent: a.low ? 'Low' : 'OK' }));
+
+    const btn = el('button', { type: 'button', textContent: a.blocked ? 'Unblock' : 'Block', className: a.blocked ? '' : 'danger' });
+    btn.onclick = () => {
+      if (a.blocked) {
+        const entry = (acctData.blocked || []).find((b) => [b.id, b.accountId, b.accountNumber].some((k) => k && (k === a.accountId || k === a.accountNumber)));
+        if (!entry) return toast('Blocked entry not found', true);
+        return run(btn, () => api('DELETE', `/api/blocked/${encodeURIComponent(entry.id)}`), 'Unblocked').then(loadAccounts);
+      }
+      run(btn, () => api('POST', '/api/blocked', {
+        id: a.accountNumber || a.accountId, accountId: a.accountId, accountNumber: a.accountNumber,
+        label: a.customerName, bankName: a.bankName,
+      }), 'Account blocked').then(loadAccounts);
+    };
+
+    table.append(el('tr', { className: tracked(a) ? '' : 'dim' },
+      el('td', { textContent: a.customerName || '—' }),
+      el('td', { textContent: a.bankName || '—' }),
+      el('td', {}, el('code', { textContent: a.accountNumber || a.accountId })),
+      el('td', { className: 'num', textContent: inr(a.balance) }),
+      status,
+      el('td', { className: 'actions' }, btn)));
+  }
+}
+
+$('#acct-q').addEventListener('input', renderAccounts);
+$('#acct-filter').addEventListener('change', renderAccounts);
+
+$('#skip-inactive').addEventListener('change', async (ev) => {
+  const box = ev.target;
+  box.disabled = true;
+  try {
+    await api('POST', '/api/settings', { skipInactive: box.checked });
+    toast(box.checked ? 'Inactive accounts will be skipped' : 'Inactive accounts will be checked');
+    await loadAccounts();
+  } catch (e) {
+    box.checked = !box.checked;
+    toast(e.message, true);
+  } finally {
+    box.disabled = false;
+  }
+});
+
+$('#run-check').onclick = () => {
+  const b = $('#run-check');
+  b.textContent = 'Checking…';
+  run(b, () => api('POST', '/api/check-balances'), 'Balance check complete')
+    .then(loadAccounts)
+    .finally(() => (b.textContent = 'Run balance check now'));
+};
+
+$('#block-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const form = ev.target;
+  const f = form.elements;
+  const btn = form.querySelector('button');
+  const body = { id: f.namedItem('account').value.trim(), label: f.namedItem('label').value.trim() };
+  run(btn, async () => { await api('POST', '/api/blocked', body); form.reset(); }, 'Account blocked').then(loadAccounts);
+});
+document.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => showTab(b.dataset.tab)));
+
+// --- logs ---
+let lastSeq = 0;
+let logReq = 0;
+
+function logRow(e) {
+  return el('div', { className: 'log ' + e.level },
+    el('time', { textContent: fmt(e.ts) }),
+    el('span', { className: 'lvl', textContent: e.level }),
+    el('span', { className: 'msg', textContent: e.text }));
+}
+
+async function loadLogs(reset) {
+  const id = ++logReq;
+  const params = new URLSearchParams({
+    q: $('#log-q').value.trim(),
+    level: $('#log-level').value,
+    after: reset ? 0 : lastSeq,
+    limit: 500,
+  });
+  let data;
+  try { data = await api('GET', '/api/logs?' + params); }
+  catch (e) { return toast('Failed to load logs: ' + e.message, true); }
+  if (id !== logReq) return; // a newer request superseded this one
+
+  const box = $('#logs');
+  if (reset) box.replaceChildren();
+  box.querySelector('.empty')?.remove();
+  lastSeq = data.lastSeq;
+
+  const frag = document.createDocumentFragment();
+  for (const e of data.entries.slice().reverse()) frag.append(logRow(e)); // newest first
+  box.prepend(frag);
+  while (box.children.length > 2000) box.lastChild.remove();
+
+  if (!box.children.length) box.append(el('div', { className: 'empty', textContent: 'No log entries match.' }));
+  const n = box.querySelectorAll('.log').length;
+  $('#log-info').textContent = `${n} entr${n === 1 ? 'y' : 'ies'} shown · newest first`;
+}
+
+function syncChips() {
+  const q = $('#log-q').value.trim();
+  document.querySelectorAll('#log-chips button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.q === q)));
+}
+
+let searchTimer;
+$('#log-q').addEventListener('input', () => {
+  syncChips();
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => loadLogs(true), 300);
+});
+$('#log-level').addEventListener('change', () => loadLogs(true));
+document.querySelectorAll('#log-chips button').forEach((b) => (b.onclick = () => {
+  $('#log-q').value = b.dataset.q;
+  syncChips();
+  loadLogs(true);
+}));
+
+setInterval(() => {
+  if (!$('#tab-logs').hidden && $('#log-live').checked) loadLogs(false);
+}, 5000);
+
+// --- start ---
+load();
+setInterval(load, 30000);
+setInterval(() => { if (!$('#tab-chats').hidden) loadChats(); }, 30000);
+if (TABS.includes(location.hash.slice(1))) showTab(location.hash.slice(1));
+</script>
+</body>
+</html>

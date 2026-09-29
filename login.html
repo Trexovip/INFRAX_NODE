@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bot Admin · Login</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1b1f24; --muted: #667085; --border: #e3e6ea;
+    --accent: #2563eb; --danger: #c62828;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418; --card: #1a1e24; --text: #e6e8eb; --muted: #98a2b3; --border: #2b3139;
+      --accent: #4c8dff; --danger: #ff6b6b;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px;
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  form { width: 100%; max-width: 360px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 28px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p { color: var(--muted); margin: 0 0 20px; }
+  label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
+  input { width: 100%; padding: 9px 11px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: 6px;
+          background: var(--bg); color: var(--text); font: inherit; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button { width: 100%; padding: 10px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; font: inherit; font-weight: 500; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  #error { color: var(--danger); font-size: 13px; margin: 12px 0 0; min-height: 1em; }
+</style>
+</head>
+<body>
+<form id="login">
+  <h1>Monitoring Bot · Admin</h1>
+  <p>Sign in to continue.</p>
+  <label for="username">User ID</label>
+  <input id="username" name="username" autocomplete="username" required autofocus>
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <button>Sign in</button>
+  <div id="error" role="alert"></div>
+</form>
+<script>
+const form = document.getElementById('login');
+const error = document.getElementById('error');
+form.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const btn = form.querySelector('button');
+  btn.disabled = true;
+  error.textContent = '';
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: form.username.value.trim(), password: form.password.value }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Login failed');
+    location.href = '/';
+  } catch (e) {
+    error.textContent = e.message;
+    form.password.value = '';
+    form.password.focus();
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
