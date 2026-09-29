@@ -10,7 +10,7 @@
    ADMIN_PASSWORD=choose-a-strong-password
    ```
 5. `npm start`, open http://localhost:3000 and sign in.
-6. **Settings** tab: paste the bot token, add your API key(s), then add a balance API and a transactions API.
+6. **Settings** tab: paste the bot token. **Functions** tab: set the master key and add APIs to *Balance check* and *Transaction failures*, and create your own functions.
 7. Send `/id` in the group and add that chat under **Access → Alert chats** (or approve it from Access requests).
 
 Existing `.env` values (`TELEGRAM_BOT_TOKEN`, `TREXO_KEY`, `TREXO_SECRET`, `BALANCE_API_URL`, `TXN_API_URL`, `ALERT_CHAT_IDS`, `ALLOWED_USER_IDS`) are imported automatically on first start. After that the admin panel is the source of truth.
@@ -20,7 +20,7 @@ Everything the panel changes is stored in `DATA_DIR` (default: the project folde
 
 | File | Contents |
 |---|---|
-| `config.json` | bot token, API keys, APIs, auto-clear settings – **contains secrets** |
+| `config.json` | bot token, functions (APIs and keys), auto-clear settings – **contains secrets** |
 | `access.json` | alert chats, allowed users, blocked accounts, access requests |
 | `state.json` | alert state, balances, message IDs for chat clearing |
 | `logs.jsonl` | logs shown in the Logs tab |
@@ -51,10 +51,25 @@ TIMEZONE=Asia/Kolkata                     # used for daily auto-clear time and m
 - **Clear now** per chat, or **Clear all chats**. `/clear` in Telegram clears the current chat.
 - Bots cannot read chat history, so the bot remembers the IDs of messages it sends and commands it handles, and deletes those. Telegram only allows deleting messages younger than 48 hours; messages sent before this feature existed can't be cleared.
 
+**Functions tab**
+A function is a set of APIs with its own **master key**. Each API uses the function's master key, its own separate key, or no key. Key header names are configurable (default `x-trexo-key` / `x-trexo-secret`). Keys are only ever shown masked; leave key fields blank when editing to keep them.
+
+- **Balance check** (built-in) – its APIs feed low-balance alerts and `/bal`, `/balance`, `/low`. Add several and the accounts are combined.
+- **Transaction failures** (built-in) – its APIs feed failure-streak alerts and `/failures`.
+- **Custom functions** – click **+ New function**:
+  - **Telegram command**, e.g. `trxn_wezbo` → `/trxn_wezbo` in Telegram. It appears in `/help` and the bot's command menu.
+  - **APIs**: URL, GET/POST, optional query parameters (placeholders `{today}`, `{now}`, `{1h_ago}`, `{24h_ago}`), and which value to read: a number field (`data.count`), the number of items in a list, or the sum of a field across a list. Optionally pass the command text as a parameter (`/trxn_wezbo acme` → `?merchant=acme`).
+  - **Alerts** (optional): check every N minutes and notify alert chats when the value is below/above/equal to a threshold – e.g. *below 100*. Sends one alert, reminders every N minutes (0 = never) and a “back to normal” message.
+  - **Test** on an API shows the value it returns; **Check now** runs the alert check immediately.
+
+Example – “notify when Wezbo transaction count goes below 100”:
+1. **+ New function** → name *Wezbo transactions*, command `trxn_wezbo`, master key = your Wezbo key.
+2. Turn on alerts: every 5 minutes, *below*, threshold `100`.
+3. **+ Add API** → URL of the count API, key *Function's master key*, value *A number field* `data.count` (or *Number of items in a list*).
+4. **Test** it, then try `/trxn_wezbo` in Telegram.
+
 **Settings tab**
 - **Telegram bot**: change the token. It's verified with Telegram first, then the bot reconnects without a restart.
-- **API keys**: as many key/secret sets as you need, with configurable header names (default `x-trexo-key` / `x-trexo-secret`). Stored values are only shown masked; leave fields blank when editing to keep them.
-- **APIs**: add any number of balance and transaction APIs, each using one of the API keys. Results from all enabled APIs are combined. **Test** calls the API once and shows the status, item count and fields returned.
 
 **Logs tab** – everything the bot logs: alerts `[ALERT]`, commands `[CMD]`, denied access `[DENIED]`, admin actions `[ADMIN]`, chat clears `[CLEAR]`, errors. Secrets are masked as `***`.
 
