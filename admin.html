@@ -118,6 +118,7 @@
     <button type="button" role="tab" data-tab="access" aria-selected="true">Access</button>
     <button type="button" role="tab" data-tab="accounts" aria-selected="false">Accounts</button>
     <button type="button" role="tab" data-tab="chats" aria-selected="false">Chats</button>
+    <button type="button" role="tab" data-tab="functions" aria-selected="false">Functions</button>
     <button type="button" role="tab" data-tab="settings" aria-selected="false">Settings</button>
     <button type="button" role="tab" data-tab="logs" aria-selected="false">Logs</button>
   </nav>
@@ -240,54 +241,130 @@
     </form>
     <p class="hint" style="margin:0">The token is checked with Telegram before it replaces the current one. The bot reconnects immediately.</p>
   </section>
+  </div>
 
-  <section>
-    <h2>API keys <span class="count" id="creds-count">0</span></h2>
-    <p class="hint">Key/secret sets used to call your APIs. Add as many as you need, then pick which one each API uses below. Saved values are never shown in full.</p>
-    <div class="table-wrap"><table id="creds"></table></div>
-    <form id="cred-form" class="stack">
-      <div class="form-title" id="cred-form-title">Add API key</div>
+  <div id="tab-functions" hidden>
+  <div class="row-actions" style="margin:0 0 16px">
+    <button type="button" class="primary" id="new-fn">+ New function</button>
+    <span class="muted">A function is a Telegram command (e.g. <code>/trxn_wezbo</code>) backed by one or more APIs, with optional alerts.</span>
+  </div>
+
+  <section id="fn-editor" hidden>
+    <form id="fn-form" class="stack">
+      <h2 id="fn-form-title">New function</h2>
       <input type="hidden" name="id">
       <div class="fields">
-        <label>Name<input name="name" placeholder="e.g. Trexo – Merchant A" required autocomplete="off"></label>
+        <label>Name<input name="name" placeholder="e.g. Wezbo transaction count" required autocomplete="off"></label>
+        <label data-custom>Telegram command<input name="command" placeholder="trxn_wezbo" autocomplete="off" pattern="/?[A-Za-z0-9_]{1,32}"></label>
+        <label style="grid-column: 1 / -1">Description (shown in /help and the command menu)<input name="description" autocomplete="off"></label>
+        <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+      </div>
+
+      <div class="form-title">Master key <span class="muted" style="font-weight:400">– used by every API in this function that is set to “Master key”</span></div>
+      <div class="fields">
+        <label>Key<input name="mkey" type="password" autocomplete="off"></label>
+        <label>Secret<input name="msecret" type="password" autocomplete="off"></label>
+        <label>Key header<input name="mkeyHeader" value="x-trexo-key" autocomplete="off"></label>
+        <label>Secret header<input name="msecretHeader" value="x-trexo-secret" autocomplete="off"></label>
+      </div>
+
+      <div data-custom>
+        <div class="form-title">Alerts</div>
+        <label class="setting" style="margin-bottom:12px">
+          <input type="checkbox" name="monEnabled">
+          <span><b>Notify alert chats when the value crosses a threshold</b><span class="muted">Checks each API on a schedule. Sends one alert, optional reminders, and a message when it's back to normal.</span></span>
+        </label>
+        <div class="fields">
+          <label>Check every (minutes)<input name="everyMin" type="number" min="1" max="1440" step="1" value="5"></label>
+          <label>Alert when value is
+            <select name="op">
+              <option value="<">below (&lt;)</option>
+              <option value="<=">at or below (≤)</option>
+              <option value=">">above (&gt;)</option>
+              <option value=">=">at or above (≥)</option>
+              <option value="==">equal to (=)</option>
+              <option value="!=">not equal to (≠)</option>
+            </select>
+          </label>
+          <label>Threshold<input name="threshold" type="number" step="any" value="100"></label>
+          <label>Remind every (minutes, 0 = never)<input name="remindMin" type="number" min="0" max="10080" step="1" value="60"></label>
+          <label>Show value as
+            <select name="format">
+              <option value="number">Number (1,234)</option>
+              <option value="inr">Rupees (₹1,234.00)</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="inline">
+        <button class="primary">Save function</button>
+        <button type="button" data-cancel>Cancel</button>
+      </div>
+    </form>
+  </section>
+
+  <section id="api-editor" hidden>
+    <form id="api-form" class="stack">
+      <h2 id="api-form-title">Add API</h2>
+      <input type="hidden" name="fnId">
+      <input type="hidden" name="id">
+      <div class="fields">
+        <label>Name<input name="name" placeholder="e.g. Wezbo" required autocomplete="off"></label>
+        <label data-custom>Method
+          <select name="method"><option>GET</option><option>POST</option></select>
+        </label>
+        <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+        <label style="grid-column: 1 / -1">URL<input name="url" type="url" placeholder="https://api.example.com/api/v1/transactions/count" required autocomplete="off"></label>
+        <label data-custom style="grid-column: 1 / -1">Query parameters (optional)
+          <input name="query" placeholder="merchant=wezbo&status=SUCCESS&from={today}" autocomplete="off">
+        </label>
+        <label data-custom>Pass command text as parameter (optional)<input name="argParam" placeholder="e.g. merchant" autocomplete="off"></label>
+        <label data-txn>“Since” query parameter<input name="sinceParam" placeholder="from" autocomplete="off"></label>
+      </div>
+      <p class="hint" data-custom>Placeholders: <code>{today}</code> <code>{now}</code> <code>{1h_ago}</code> <code>{24h_ago}</code>. With a parameter name set, <code>/command wezbo</code> sends <code>?merchant=wezbo</code>.</p>
+
+      <div class="form-title">API key</div>
+      <div class="fields">
+        <label>Use
+          <select name="keyMode">
+            <option value="master">Function's master key</option>
+            <option value="own">Separate key for this API</option>
+            <option value="none">No key</option>
+          </select>
+        </label>
+      </div>
+      <div class="fields" data-own>
         <label>Key<input name="key" type="password" autocomplete="off"></label>
         <label>Secret<input name="secret" type="password" autocomplete="off"></label>
         <label>Key header<input name="keyHeader" value="x-trexo-key" autocomplete="off"></label>
         <label>Secret header<input name="secretHeader" value="x-trexo-secret" autocomplete="off"></label>
       </div>
+
+      <div data-custom>
+        <div class="form-title">Value to read from the response</div>
+        <div class="fields">
+          <label>Value is
+            <select name="valueMode">
+              <option value="path">A number field</option>
+              <option value="count">Number of items in a list</option>
+              <option value="sum">Sum of a field across a list</option>
+            </select>
+          </label>
+          <label><span data-path-label>Field path</span><input name="valuePath" placeholder="data.count" autocomplete="off"></label>
+          <label data-sum>Field to add up<input name="sumField" placeholder="amount" autocomplete="off"></label>
+        </div>
+        <p class="hint">Use dots for nested fields, e.g. <code>data.total_count</code> or <code>result.0.count</code>. Use <b>Test</b> after saving to see the value.</p>
+      </div>
+
       <div class="inline">
-        <button class="primary">Save API key</button>
-        <button type="button" data-cancel hidden>Cancel edit</button>
+        <button class="primary">Save API</button>
+        <button type="button" data-cancel>Cancel</button>
       </div>
     </form>
   </section>
 
-  <section>
-    <h2>APIs <span class="count" id="eps-count">0</span></h2>
-    <p class="hint">Balance APIs are checked every few minutes for low balances; transaction APIs for failure streaks. You can add several of each – results are combined.</p>
-    <div class="table-wrap"><table id="eps"></table></div>
-    <form id="ep-form" class="stack">
-      <div class="form-title" id="ep-form-title">Add API</div>
-      <input type="hidden" name="id">
-      <div class="fields">
-        <label>Name<input name="name" placeholder="e.g. Merchant A balances" required autocomplete="off"></label>
-        <label>Used for
-          <select name="type">
-            <option value="balance">Balance check</option>
-            <option value="transactions">Transactions (failures)</option>
-          </select>
-        </label>
-        <label>API key to use<select name="credentialId"></select></label>
-        <label style="grid-column: 1 / -1">URL<input name="url" type="url" placeholder="https://api.example.com/api/v1/accounts" required autocomplete="off"></label>
-        <label data-since>“Since” query parameter<input name="sinceParam" placeholder="from" autocomplete="off"></label>
-        <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
-      </div>
-      <div class="inline">
-        <button class="primary">Save API</button>
-        <button type="button" data-cancel hidden>Cancel edit</button>
-      </div>
-    </form>
-  </section>
+  <div id="fn-list"></div>
   </div>
 
   <div id="tab-logs" hidden>
@@ -478,8 +555,9 @@ function showTab(name) {
   if (name === 'accounts') loadAccounts();
   if (name === 'chats') loadChats();
   if (name === 'settings') loadSettings();
+  if (name === 'functions') loadFunctions();
 }
-const TABS = ['access', 'accounts', 'chats', 'settings', 'logs'];
+const TABS = ['access', 'accounts', 'chats', 'functions', 'settings', 'logs'];
 
 // --- chats ---
 let chatData = null;
@@ -583,157 +661,7 @@ async function loadSettings() {
       s.telegram.configured ? `Not connected – token ${s.telegram.tokenHint} was rejected or Telegram is unreachable (see Logs)` : 'No bot token set – the bot is not running');
   }
 
-  renderCreds();
-  renderEndpoints();
 }
-
-function renderCreds() {
-  const rows = settingsData.credentials;
-  $('#creds-count').textContent = rows.length;
-  const table = $('#creds');
-  table.replaceChildren();
-  if (!rows.length) {
-    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 5, textContent: 'No API keys yet.' })));
-  } else {
-    table.append(el('tr', {},
-      el('th', { textContent: 'Name' }), el('th', { textContent: 'Key' }), el('th', { textContent: 'Secret' }),
-      el('th', { textContent: 'Used by' }), el('th')));
-    for (const c of rows) {
-      const edit = el('button', { type: 'button', textContent: 'Edit' });
-      edit.onclick = () => editCred(c);
-      const del = confirmButton('Delete', () => api('DELETE', `/api/settings/credentials/${encodeURIComponent(c.id)}`), 'API key deleted', loadSettings);
-      table.append(el('tr', {},
-        el('td', {}, el('div', { textContent: c.name }),
-          el('span', { className: 'muted', textContent: [c.keyHeader, c.secretHeader].filter(Boolean).join(' · ') })),
-        el('td', {}, el('code', { textContent: c.keyHint || '—' })),
-        el('td', {}, el('code', { textContent: c.secretHint || '—' })),
-        el('td', { textContent: c.usedBy.join(', ') || '—', className: c.usedBy.length ? '' : 'muted' }),
-        el('td', { className: 'actions' }, edit, del)));
-    }
-  }
-
-  // API key picker in the endpoint form
-  const sel = $('#ep-form').elements.namedItem('credentialId');
-  const current = sel.value;
-  sel.replaceChildren(el('option', { value: '', textContent: 'None (no auth headers)' }),
-    ...rows.map((c) => el('option', { value: c.id, textContent: c.name })));
-  sel.value = rows.some((c) => c.id === current) ? current : (rows[0]?.id || '');
-}
-
-function resetForm(form, title, titleText) {
-  form.reset();
-  form.elements.namedItem('id').value = '';
-  $(title).textContent = titleText;
-  form.querySelector('[data-cancel]').hidden = true;
-}
-
-function editCred(c) {
-  const form = $('#cred-form');
-  const f = form.elements;
-  f.namedItem('id').value = c.id;
-  f.namedItem('name').value = c.name;
-  f.namedItem('key').value = '';
-  f.namedItem('secret').value = '';
-  f.namedItem('key').placeholder = `${c.keyHint || 'not set'} – leave blank to keep`;
-  f.namedItem('secret').placeholder = `${c.secretHint || 'not set'} – leave blank to keep`;
-  f.namedItem('keyHeader').value = c.keyHeader;
-  f.namedItem('secretHeader').value = c.secretHeader;
-  $('#cred-form-title').textContent = `Edit API key “${c.name}”`;
-  form.querySelector('[data-cancel]').hidden = false;
-  form.scrollIntoView({ behavior: 'smooth', block: 'center' });
-}
-
-$('#cred-form [data-cancel]').onclick = () => {
-  const f = $('#cred-form').elements;
-  f.namedItem('key').placeholder = f.namedItem('secret').placeholder = '';
-  resetForm($('#cred-form'), '#cred-form-title', 'Add API key');
-};
-
-$('#cred-form').addEventListener('submit', (ev) => {
-  ev.preventDefault();
-  const form = ev.target;
-  const f = form.elements;
-  const body = Object.fromEntries(['id', 'name', 'key', 'secret', 'keyHeader', 'secretHeader'].map((k) => [k, f.namedItem(k).value.trim()]));
-  if (!body.id) delete body.id;
-  run(form.querySelector('button.primary'), async () => {
-    await api('POST', '/api/settings/credentials', body);
-    f.namedItem('key').placeholder = f.namedItem('secret').placeholder = '';
-    resetForm(form, '#cred-form-title', 'Add API key');
-  }, 'API key saved').then(loadSettings);
-});
-
-function renderEndpoints() {
-  const rows = settingsData.endpoints;
-  const credName = (id) => settingsData.credentials.find((c) => c.id === id)?.name;
-  $('#eps-count').textContent = rows.length;
-  const table = $('#eps');
-  table.replaceChildren();
-  if (!rows.length) {
-    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 5, textContent: 'No APIs yet – add a balance API and a transactions API below.' })));
-    return;
-  }
-  table.append(el('tr', {},
-    el('th', { textContent: 'Name' }), el('th', { textContent: 'Used for' }), el('th', { textContent: 'URL' }),
-    el('th', { textContent: 'API key' }), el('th')));
-  for (const e of rows) {
-    const test = el('button', { type: 'button', textContent: 'Test' });
-    test.onclick = async () => {
-      test.disabled = true;
-      try {
-        const r = await api('POST', `/api/settings/endpoints/${encodeURIComponent(e.id)}/test`);
-        toast(r.ok ? `✓ HTTP ${r.status} in ${r.ms} ms · ${r.items} item(s)${r.fields.length ? ' · fields: ' + r.fields.slice(0, 8).join(', ') : ''}` : `✗ ${r.error}`, !r.ok);
-      } catch (err) { toast(err.message, true); }
-      finally { test.disabled = false; }
-    };
-    const edit = el('button', { type: 'button', textContent: 'Edit' });
-    edit.onclick = () => editEndpoint(e);
-    const del = confirmButton('Delete', () => api('DELETE', `/api/settings/endpoints/${encodeURIComponent(e.id)}`), 'API deleted', loadSettings);
-    table.append(el('tr', { className: e.enabled ? '' : 'dim' },
-      el('td', {}, el('div', { textContent: e.name }), e.enabled ? '' : el('span', { className: 'tag', textContent: 'Disabled' })),
-      el('td', { textContent: e.type === 'balance' ? 'Balance check' : 'Transactions' }),
-      el('td', {}, el('code', { className: 'url', textContent: e.url, title: e.url })),
-      el('td', { textContent: credName(e.credentialId) || 'None', className: e.credentialId ? '' : 'muted' }),
-      el('td', { className: 'actions' }, test, edit, del)));
-  }
-}
-
-function syncEndpointForm() {
-  const f = $('#ep-form').elements;
-  $('#ep-form [data-since]').hidden = f.namedItem('type').value !== 'transactions';
-}
-$('#ep-form').elements.namedItem('type').addEventListener('change', syncEndpointForm);
-syncEndpointForm();
-
-function editEndpoint(e) {
-  const form = $('#ep-form');
-  const f = form.elements;
-  for (const k of ['id', 'name', 'type', 'url', 'credentialId', 'sinceParam']) f.namedItem(k).value = e[k] ?? '';
-  f.namedItem('enabled').checked = e.enabled;
-  $('#ep-form-title').textContent = `Edit API “${e.name}”`;
-  form.querySelector('[data-cancel]').hidden = false;
-  syncEndpointForm();
-  form.scrollIntoView({ behavior: 'smooth', block: 'center' });
-}
-
-$('#ep-form [data-cancel]').onclick = () => {
-  resetForm($('#ep-form'), '#ep-form-title', 'Add API');
-  renderCreds();
-  syncEndpointForm();
-};
-
-$('#ep-form').addEventListener('submit', (ev) => {
-  ev.preventDefault();
-  const form = ev.target;
-  const f = form.elements;
-  const body = Object.fromEntries(['id', 'name', 'type', 'url', 'credentialId', 'sinceParam'].map((k) => [k, f.namedItem(k).value.trim()]));
-  body.enabled = f.namedItem('enabled').checked;
-  if (!body.id) delete body.id;
-  run(form.querySelector('button.primary'), async () => {
-    await api('POST', '/api/settings/endpoints', body);
-    resetForm(form, '#ep-form-title', 'Add API');
-  }, 'API saved').then(() => loadSettings().then(syncEndpointForm));
-});
-
 $('#token-form').addEventListener('submit', (ev) => {
   ev.preventDefault();
   const form = ev.target;
@@ -745,8 +673,216 @@ $('#token-form').addEventListener('submit', (ev) => {
   }).then(loadSettings);
 });
 
+// --- functions ---
+let fnData = null;
+const OP_TEXT = { '<': 'below', '<=': 'at or below', '>': 'above', '>=': 'at or above', '==': 'equal to', '!=': 'not equal to' };
+const KEY_TEXT = { master: 'Master key', own: 'Own key', none: 'No key' };
+
+async function loadFunctions() {
+  try { fnData = await api('GET', '/api/functions'); }
+  catch (e) { return toast('Failed to load functions: ' + e.message, true); }
+  renderFunctions();
+}
+
+function valueText(a) {
+  if (a.valueMode === 'count') return `count of items${a.valuePath ? ` in ${a.valuePath}` : ''}`;
+  if (a.valueMode === 'sum') return `sum of ${a.sumField}${a.valuePath ? ` in ${a.valuePath}` : ''}`;
+  return `field ${a.valuePath}`;
+}
+
+function renderFunctions() {
+  const list = $('#fn-list');
+  list.replaceChildren();
+  for (const fn of fnData.functions) {
+    const custom = !fn.builtin;
+    const activeAlerts = Object.keys(fnData.activeAlerts).filter((k) => k.startsWith(fn.id + ':')).length;
+
+    const title = el('h2', {}, fn.name,
+      fn.builtin ? el('span', { className: 'tag', textContent: 'Built-in' }) : el('code', { className: 'tag', textContent: '/' + fn.command }),
+      fn.enabled ? '' : el('span', { className: 'tag', textContent: 'Disabled' }),
+      activeAlerts ? el('span', { className: 'tag low', textContent: `${activeAlerts} alert(s) active` }) : '');
+
+    const bits = [];
+    if (fn.description) bits.push(fn.description);
+    bits.push(`Master key: ${fn.master.keyHint || fn.master.secretHint ? `${fn.master.keyHint || '—'} / ${fn.master.secretHint || '—'}` : 'not set'}`);
+    if (custom) {
+      const m = fn.monitor || {};
+      bits.push(m.enabled
+        ? `Alerts when value is ${OP_TEXT[m.op]} ${m.threshold}, checked every ${m.everyMin} min` + (fnData.lastRun[fn.id] ? ` · last check ${fmt(fnData.lastRun[fn.id])}` : '')
+        : 'Alerts off – command only');
+    }
+    const hint = el('p', { className: 'hint', textContent: bits.join(' · ') });
+
+    const table = el('table');
+    if (!fn.apis.length) {
+      table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 5, textContent: 'No APIs yet.' })));
+    } else {
+      table.append(el('tr', {},
+        el('th', { textContent: 'API' }), el('th', { textContent: 'URL' }), el('th', { textContent: 'Key' }),
+        custom ? el('th', { textContent: 'Value' }) : '', el('th')));
+      for (const a of fn.apis) {
+        const test = el('button', { type: 'button', textContent: 'Test' });
+        test.onclick = async () => {
+          test.disabled = true;
+          try {
+            const r = await api('POST', `/api/functions/${encodeURIComponent(fn.id)}/apis/${encodeURIComponent(a.id)}/test`);
+            toast(r.ok
+              ? `✓ HTTP ${r.status} in ${r.ms} ms` + (r.value !== undefined ? ` · value ${r.value}` : ` · ${r.items} item(s)`) +
+                (r.fields.length ? ` · fields: ${r.fields.slice(0, 8).join(', ')}` : '')
+              : `✗ ${r.error}`, !r.ok);
+          } catch (err) { toast(err.message, true); }
+          finally { test.disabled = false; }
+        };
+        const edit = el('button', { type: 'button', textContent: 'Edit' });
+        edit.onclick = () => openApiEditor(fn, a);
+        const del = confirmButton('Delete', () => api('DELETE', `/api/functions/${encodeURIComponent(fn.id)}/apis/${encodeURIComponent(a.id)}`), 'API deleted', loadFunctions);
+        const keyCell = a.keyMode === 'own' ? `Own · ${a.keyHint || a.secretHint || '—'}` : KEY_TEXT[a.keyMode];
+        table.append(el('tr', { className: a.enabled ? '' : 'dim' },
+          el('td', {}, el('div', { textContent: a.name }), a.enabled ? '' : el('span', { className: 'tag', textContent: 'Disabled' })),
+          el('td', {}, el('code', { className: 'url', textContent: `${a.method && a.method !== 'GET' ? a.method + ' ' : ''}${a.url}`, title: a.url })),
+          el('td', { textContent: keyCell }),
+          custom ? el('td', { className: 'muted', textContent: valueText(a) }) : '',
+          el('td', { className: 'actions' }, test, edit, del)));
+      }
+    }
+
+    const actions = el('div', { className: 'row-actions' });
+    const addApi = el('button', { type: 'button', className: 'primary', textContent: '+ Add API' });
+    addApi.onclick = () => openApiEditor(fn);
+    const editFn = el('button', { type: 'button', textContent: 'Edit function' });
+    editFn.onclick = () => openFnEditor(fn);
+    actions.append(addApi, editFn);
+    if (custom && fn.monitor?.enabled) {
+      const runNow = el('button', { type: 'button', textContent: 'Check now' });
+      runNow.onclick = () => run(runNow, () => api('POST', `/api/functions/${encodeURIComponent(fn.id)}/run`), 'Check complete – alerts sent if needed').then(loadFunctions);
+      actions.append(runNow);
+    }
+    if (custom) {
+      actions.append(confirmButton('Delete function', () => api('DELETE', `/api/functions/${encodeURIComponent(fn.id)}`), 'Function deleted', loadFunctions));
+    }
+
+    list.append(el('section', {}, title, hint, el('div', { className: 'table-wrap' }, table), actions));
+  }
+}
+
+function showEditor(which) {
+  $('#fn-editor').hidden = which !== 'fn';
+  $('#api-editor').hidden = which !== 'api';
+  if (which) $(which === 'fn' ? '#fn-editor' : '#api-editor').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function openFnEditor(fn) {
+  const form = $('#fn-form');
+  form.reset();
+  const f = form.elements;
+  const custom = !fn || !fn.builtin;
+  form.querySelectorAll('[data-custom]').forEach((n) => (n.hidden = !custom));
+  f.namedItem('command').required = custom;
+  f.namedItem('id').value = fn?.id || '';
+  $('#fn-form-title').textContent = fn ? `Edit function “${fn.name}”` : 'New function';
+  f.namedItem('mkey').placeholder = fn?.master.keyHint ? `${fn.master.keyHint} – leave blank to keep` : '';
+  f.namedItem('msecret').placeholder = fn?.master.secretHint ? `${fn.master.secretHint} – leave blank to keep` : '';
+  if (fn) {
+    f.namedItem('name').value = fn.name;
+    f.namedItem('command').value = fn.command || '';
+    f.namedItem('description').value = fn.description || '';
+    f.namedItem('enabled').checked = fn.enabled;
+    f.namedItem('mkeyHeader').value = fn.master.keyHeader ?? '';
+    f.namedItem('msecretHeader').value = fn.master.secretHeader ?? '';
+    const m = fn.monitor || {};
+    if (custom) {
+      f.namedItem('monEnabled').checked = !!m.enabled;
+      f.namedItem('everyMin').value = m.everyMin ?? 5;
+      f.namedItem('op').value = m.op || '<';
+      f.namedItem('threshold').value = m.threshold ?? 100;
+      f.namedItem('remindMin').value = m.remindMin ?? 60;
+      f.namedItem('format').value = fn.format || 'number';
+    }
+  }
+  showEditor('fn');
+}
+
+$('#new-fn').onclick = () => openFnEditor(null);
+$('#fn-form [data-cancel]').onclick = () => showEditor(null);
+
+$('#fn-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const f = ev.target.elements;
+  const v = (k) => f.namedItem(k).value.trim();
+  const body = {
+    name: v('name'), command: v('command'), description: v('description'), enabled: f.namedItem('enabled').checked,
+    master: { key: v('mkey'), secret: v('msecret'), keyHeader: v('mkeyHeader'), secretHeader: v('msecretHeader') },
+    monitor: {
+      enabled: f.namedItem('monEnabled').checked, everyMin: Number(v('everyMin')), op: v('op'),
+      threshold: Number(v('threshold')), remindMin: Number(v('remindMin')),
+    },
+    format: v('format'),
+  };
+  if (v('id')) body.id = v('id');
+  run(ev.target.querySelector('button.primary'), async () => {
+    await api('POST', '/api/functions', body);
+    showEditor(null);
+  }, 'Function saved').then(loadFunctions);
+});
+
+function syncApiForm() {
+  const form = $('#api-form');
+  const f = form.elements;
+  const fn = fnData?.functions.find((x) => x.id === f.namedItem('fnId').value);
+  const custom = fn && !fn.builtin;
+  form.querySelectorAll('[data-custom]').forEach((n) => (n.hidden = !custom));
+  form.querySelectorAll('[data-txn]').forEach((n) => (n.hidden = fn?.builtin !== 'transactions'));
+  form.querySelector('[data-own]').hidden = f.namedItem('keyMode').value !== 'own';
+  const mode = f.namedItem('valueMode').value;
+  form.querySelector('[data-sum]').hidden = mode !== 'sum';
+  form.querySelector('[data-path-label]').textContent = mode === 'path' ? 'Field path' : 'List field (blank = auto-detect)';
+  f.namedItem('valuePath').placeholder = mode === 'path' ? 'data.count' : 'data';
+}
+$('#api-form').addEventListener('change', syncApiForm);
+
+function openApiEditor(fn, a) {
+  const form = $('#api-form');
+  form.reset();
+  const f = form.elements;
+  f.namedItem('fnId').value = fn.id;
+  f.namedItem('id').value = a?.id || '';
+  $('#api-form-title').textContent = a ? `Edit API “${a.name}” · ${fn.name}` : `Add API to ${fn.name}`;
+  f.namedItem('key').placeholder = a?.keyHint ? `${a.keyHint} – leave blank to keep` : '';
+  f.namedItem('secret').placeholder = a?.secretHint ? `${a.secretHint} – leave blank to keep` : '';
+  if (a) {
+    for (const k of ['name', 'url', 'method', 'query', 'argParam', 'sinceParam', 'keyMode', 'valueMode', 'valuePath', 'sumField']) {
+      if (a[k] !== undefined) f.namedItem(k).value = a[k];
+    }
+    if (a.keyMode === 'own') {
+      f.namedItem('keyHeader').value = a.keyHeader ?? '';
+      f.namedItem('secretHeader').value = a.secretHeader ?? '';
+    }
+    f.namedItem('enabled').checked = a.enabled;
+  } else if (fn.builtin === 'transactions') {
+    f.namedItem('sinceParam').value = 'from';
+  }
+  syncApiForm();
+  showEditor('api');
+}
+
+$('#api-form [data-cancel]').onclick = () => showEditor(null);
+
+$('#api-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const f = ev.target.elements;
+  const v = (k) => f.namedItem(k).value.trim();
+  const body = Object.fromEntries(['id', 'name', 'url', 'method', 'query', 'argParam', 'sinceParam', 'keyMode',
+    'key', 'secret', 'keyHeader', 'secretHeader', 'valueMode', 'valuePath', 'sumField'].map((k) => [k, v(k)]));
+  body.enabled = f.namedItem('enabled').checked;
+  if (!body.id) delete body.id;
+  run(ev.target.querySelector('button.primary'), async () => {
+    await api('POST', `/api/functions/${encodeURIComponent(v('fnId'))}/apis`, body);
+    showEditor(null);
+  }, 'API saved').then(loadFunctions);
+});
+
 // --- accounts ---
-const inr = (n) => Number(n).toLocaleString('en-IN', { style: 'currency', currency: 'INR' });
+const inr =(n) => Number(n).toLocaleString('en-IN', { style: 'currency', currency: 'INR' });
 let acctData = { accounts: [], blocked: [], settings: {} };
 
 async function loadAccounts() {
