@@ -51,6 +51,21 @@ TIMEZONE=Asia/Kolkata                     # used for daily auto-clear time and m
 - **Clear now** per chat, or **Clear all chats**. `/clear` in Telegram clears the current chat.
 - Bots cannot read chat history, so the bot remembers the IDs of messages it sends and commands it handles, and deletes those. Telegram only allows deleting messages younger than 48 hours; messages sent before this feature existed can't be cleared.
 
+**Webhooks tab** – transaction notifications pushed by your payment API
+- **+ New webhook** gives you a URL like `https://<your-domain>/webhook/<id>/<secret>`. Paste it into your provider's webhook settings. The panel must be reachable from the internet (e.g. your Railway domain) – `localhost` won't work.
+- **Notify for** ❌ Failed, ⏳ Pending, ✅ Success – each can be switched on/off. Notifications go to all alert chats, or to specific chat IDs.
+- **Security** – pick one: secret in the URL (simplest), secret in a header (e.g. `X-Webhook-Secret`, `Bearer` accepted), or an **HMAC-SHA256 signature** header (hex or base64, optional `sha256=` prefix) using your provider's signing secret. Deliveries that fail the check are rejected with 401.
+- The transaction is read from the body whether it's the object itself, a list, or wrapped (`data`, `transaction`, `payload`…). The status comes from `status`/`txn_status`, or from the event name (`payment.failed` → FAILED). Which words mean failed/pending/success is editable per webhook.
+- Retries are de-duplicated: one notification per transaction + status. Blocked accounts are skipped.
+- **Also count towards consecutive-failure alerts** feeds webhook results into the same failure-streak alerts as the transactions API (a transaction is never counted twice).
+- **Test failed / pending / success** sends a sample notification. **Recent deliveries** shows the last 25 calls with the result and the raw payload (kept in memory only).
+
+**Commands tab**
+- Every built-in command (`/status`, `/balance`, `/bal`, `/low`, `/failures`, `/check`, `/clear`, `/id`) can be **renamed**, given a new **description**, and switched **Active / Inactive**. Inactive commands are ignored by the bot and hidden from `/help` and Telegram's command menu.
+- Your function commands are listed too, with the same Active / Inactive button (inactive also pauses the function's alerts).
+- `/help` (and `/start`) is always on and is generated from whatever is active – the tab shows a live preview.
+- Command names must be unique across built-ins and functions; a switched-off built-in still keeps its name.
+
 **Functions tab**
 A function is a set of APIs with its own **master key**. Each API uses the function's master key, its own separate key, or no key. Key header names are configurable (default `x-trexo-key` / `x-trexo-secret`). Keys are only ever shown masked; leave key fields blank when editing to keep them.
 
@@ -71,7 +86,7 @@ Example – “notify when Wezbo transaction count goes below 100”:
 **Settings tab**
 - **Telegram bot**: change the token. It's verified with Telegram first, then the bot reconnects without a restart.
 
-**Logs tab** – everything the bot logs: alerts `[ALERT]`, commands `[CMD]`, denied access `[DENIED]`, admin actions `[ADMIN]`, chat clears `[CLEAR]`, errors. Secrets are masked as `***`.
+**Logs tab** – everything the bot logs: alerts `[ALERT]`, commands `[CMD]`, denied access `[DENIED]`, admin actions `[ADMIN]`, chat clears `[CLEAR]`, webhook deliveries `[WEBHOOK]`, errors. Secrets are masked as `***`.
 
 **Security**
 - Sessions last 12 hours. After 5 wrong passwords from the same IP, login is locked for 15 minutes.
@@ -85,7 +100,7 @@ pm2 save && pm2 startup
 ```
 
 ## Adapting to your API
-Edit `mapBalance()` and `mapTransaction()` in `index.js` so the field names match your API response. Use **Test** in the Settings tab to see which fields your API returns.
+Edit `mapBalance()` and `mapTransaction()` in `index.js` so the field names match your API response. Use **Test** on an API in the Functions tab to see which fields it returns.
 
 ## Alerts
 - 🚨 Customer has FAIL_THRESHOLD+ failed transactions in a row (repeats every FAIL_REPEAT_EVERY more failures)
