@@ -30,6 +30,14 @@ const BUILTIN_COMMANDS = [
   { key: 'id', command: 'id', description: 'Show chat/user ID', what: 'Replies with the chat ID and user ID – works for everyone, even without access' },
 ];
 
+// transaction status words per notification type (editable per webhook)
+const DEFAULT_WEBHOOK_STATUSES = {
+  failed: 'FAILED,FAILURE,DECLINED,REJECTED,ERROR',
+  pending: 'PENDING,PROCESSING,INITIATED,IN_PROGRESS,CREATED,SUBMITTED',
+  success: 'SUCCESS,SUCCESSFUL,COMPLETED,SETTLED',
+};
+const newSecret = () => crypto.randomBytes(24).toString('hex');
+
 const emptyKey = () => ({ key: '', secret: '', keyHeader: 'x-trexo-key', secretHeader: 'x-trexo-secret' });
 const pickKey = (c) => ({ key: c.key || '', secret: c.secret || '', keyHeader: c.keyHeader ?? 'x-trexo-key', secretHeader: c.secretHeader ?? 'x-trexo-secret' });
 
@@ -185,6 +193,7 @@ function createConfigStore({ file, env, writeJson }) {
     secrets: () => [
       config.telegram.botToken,
       ...config.functions.flatMap((f) => [f.master?.key, f.master?.secret, ...f.apis.flatMap((a) => [a.key, a.secret])]),
+      ...(config.webhooks || []).map((w) => w.secret),
     ],
 
     // safe to send to the browser: secrets masked
@@ -317,6 +326,60 @@ function createConfigStore({ file, env, writeJson }) {
       const before = fn.apis.length;
       fn.apis = fn.apis.filter((a) => a.id !== apiId);
       if (fn.apis.length === before) throw new Error('API not found');
+      save();
+    },
+
+    // --- transaction webhooks ---
+    webhooks: () => config.webhooks || [],
+    webhook: (id) => (config.webhooks || []).find((w) => w.id === id) || null,
+    defaultWebhookStatuses: () => ({ ...DEFAULT_WEBHOOK_STATUSES }),
+
+    upsertWebhook(data) {
+      config.webhooks ||= [];
+      const existing = data.id ? config.webhooks.find((w) => w.id === data.id) : null;
+      if (data.id && !existing) throw new Error('Webhook not found');
+      const name = text(data.name, 60, 'Name');
+      if (!name) throw new Error('Name is required');
+      const auth = ['url', 'header', 'hmac'].includes(data.auth) ? data.auth : 'url';
+      const headerName = header(data.headerName || (auth === 'hmac' ? 'X-Signature' : 'X-Webhook-Secret'), '', 'Header name');
+      if (auth !== 'url' && !headerName) throw new Error('Header name is required');
+      const secret = text(data.secret, Infinity, 'Secret') || existing?.secret || newSecret();
+      if (secret.length < 8) throw new Error('Secret must be at least 8 characters');
+      if (auth === 'url' && !/^[A-Za-z0-9_-]+$/.test(secret)) throw new Error('A secret used in the URL may only contain letters, digits, _ and -');
+      const statuses = {};
+      for (const k of Object.keys(DEFAULT_WEBHOOK_STATUSES)) {
+        statuses[k] = text(data.statuses?.[k] ?? DEFAULT_WEBHOOK_STATUSES[k], 500, `${k} statuses`).toUpperCase().replace(/\s+/g, '');
+      }
+      const chatIds = text(data.chatIds, 500, 'Chat IDs').split(',').map((s) => s.trim()).filter(Boolean);
+      for (const c of chatIds) if (!/^(-?\d{1,20}|@[A-Za-z0-9_]{5,32})$/.test(c)) throw new Error(`Invalid chat ID "${c}"`);
+
+      const entry = {
+        id: existing?.id || newId(),
+        name, auth, headerName, secret,
+        enabled: data.enabled !== false,
+        notify: { failed: data.notify?.failed !== false, pending: data.notify?.pending === true, success: data.notify?.success === true },
+        statuses,
+        chatIds: chatIds.join(','),
+        feedStreaks: data.feedStreaks !== false,
+        createdAt: existing?.createdAt || Date.now(),
+      };
+      if (existing) Object.assign(existing, entry);
+      else config.webhooks.push(entry);
+      save();
+      return entry.id;
+    },
+
+    regenerateWebhookSecret(id) {
+      const wh = (config.webhooks || []).find((w) => w.id === id);
+      if (!wh) throw new Error('Webhook not found');
+      wh.secret = newSecret();
+      save();
+    },
+
+    deleteWebhook(id) {
+      const before = (config.webhooks || []).length;
+      config.webhooks = (config.webhooks || []).filter((w) => w.id !== id);
+      if (config.webhooks.length === before) throw new Error('Webhook not found');
       save();
     },
 
