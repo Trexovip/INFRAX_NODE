@@ -91,15 +91,19 @@ function mapBalance(r) {
   };
 }
 
+// a field that may be a plain value or an object like { name: "…" }
+const nameOf = (v) => String((v && typeof v === 'object' ? v.name ?? v.title ?? '' : v) ?? '');
+
 function mapTransaction(r) {
   return {
     id: String(r.txn_id ?? r.transaction_id ?? r.transactionId ?? r.id ?? ''),
-    customerId: String(r.customer_id ?? r.customerId ?? r.account_id ?? ''),
-    customerName: r.customer_name ?? r.customerName ?? '',
+    customerId: String(r.customer_id ?? r.customerId ?? r.customer?.id ?? r.account_id ?? ''),
+    customerName: nameOf(r.customer_name ?? r.customerName ?? r.customer),
     accountId: String(r.account_id ?? r.accountId ?? r.account_number ?? ''),
     amount: Number(r.amount ?? 0),
     status: String(r.status ?? r.txn_status ?? '').toUpperCase(),
-    reason: r.failure_reason ?? r.reason ?? r.error_message ?? r.response_message ?? '',
+    reason: r.failure_reason ?? r.pending_reason ?? r.reason ?? r.status_reason ?? r.error_message ?? r.response_message ?? r.status_message ?? r.remarks ?? r.message ?? '',
+    orgName: nameOf(r.organisation_name ?? r.organization_name ?? r.org_name ?? r.organisation ?? r.organization ?? r.merchant_name ?? r.business_name ?? r.company_name ?? r.merchant),
     utr: String(r.utr ?? r.rrn ?? r.bank_reference ?? r.bank_ref_no ?? ''),
     mode: String(r.payment_mode ?? r.mode ?? r.payment_method ?? r.method ?? ''),
     time: new Date(r.created_at ?? r.timestamp ?? r.txn_date ?? r.transaction_time ?? Date.now()),
@@ -525,6 +529,11 @@ function forgetOldTransactions() {
   const cutoff = Date.now() - 2 * 24 * 3600 * 1000;
   for (const [id, ts] of Object.entries(state.seenTx)) if (ts < cutoff) delete state.seenTx[id];
   for (const [k, ts] of Object.entries(state.webhookSeen || {})) if (ts < cutoff) delete state.webhookSeen[k];
+  // webhook streaks: forget customers with no activity for 7 days
+  const idle = Date.now() - 7 * 24 * 3600 * 1000;
+  for (const customers of Object.values(state.whStreaks || {})) {
+    for (const [k, c] of Object.entries(customers)) if ((c.updatedAt || 0) < idle) delete customers[k];
+  }
 }
 
 function txnParams(ep, now) {
@@ -596,13 +605,16 @@ const safeEq = (a, b) => {
 };
 
 function verifyWebhook(wh, pathSecret, headers, rawBody) {
-  if (wh.auth === 'url') return safeEq(pathSecret || '', wh.secret);
+  if (wh.auth === 'none') return true; // no secret – anyone with the URL can post
+  const secret = config.webhookSecret(wh); // own secret, or the function's master key/secret
+  if (!secret) return false;
+  if (wh.auth === 'url') return safeEq(pathSecret || '', secret);
   const value = String(headers[wh.headerName.toLowerCase()] || '').trim();
-  if (wh.auth === 'header') return safeEq(value.replace(/^Bearer\s+/i, ''), wh.secret);
+  if (wh.auth === 'header') return safeEq(value.replace(/^Bearer\s+/i, ''), secret);
   if (wh.auth === 'hmac') {
     // HMAC-SHA256 of the raw body, hex or base64, optionally prefixed "sha256="
     const sig = value.replace(/^sha256=/i, '');
-    const mac = (enc) => crypto.createHmac('sha256', wh.secret).update(rawBody).digest(enc);
+    const mac = (enc) => crypto.createHmac('sha256', secret).update(rawBody).digest(enc);
     return safeEq(sig.toLowerCase(), mac('hex')) || safeEq(sig, mac('base64'));
   }
   return false;
@@ -641,13 +653,14 @@ function webhookText(wh, t, kind, test) {
   const k = WEBHOOK_KINDS[kind];
   return `${k.icon} <b>${k.title}</b>${test ? ' (test)' : ''}\n` +
     `Customer: ${custLabel(t.customerName, t.customerId) || '-'}\n` +
+    (t.orgName ? `Organisation: ${esc(t.orgName)}\n` : '') +
     (t.accountId ? `A/c: <code>${esc(t.accountId)}</code>\n` : '') +
     `Amount: <b>${inr(t.amount)}</b>\n` +
     `Txn: <code>${esc(t.id)}</code>\n` +
     (t.utr ? `UTR: <code>${esc(t.utr)}</code>\n` : '') +
     (t.mode ? `Mode: ${esc(t.mode)}\n` : '') +
     `Status: ${esc(t.status)}\n` +
-    (kind === 'failed' && t.reason ? `Reason: ${esc(t.reason)}\n` : '') +
+    (kind !== 'success' && t.reason ? `Reason: ${esc(t.reason)}\n` : '') +
     `Time: ${fmtTime(t.time)}\n` +
     `<i>via ${esc(wh.name)}</i>`;
 }
@@ -658,6 +671,94 @@ async function notifyTo(chatIds, text) {
   console.log('[ALERT]', text.replace(/<[^>]+>/g, '').replace(/\n/g, ' | '));
   for (const id of ids) await send(id, text);
 }
+
+// ---- "N in a row" alerts per customer (failed / pending) ----
+const STREAK_TITLES = { failed: ['🚨', 'failed'], pending: ['⏳', 'pending'] };
+const streakCustomerKey = (t) => t.customerId || t.customerName || t.orgName || t.accountId || 'unknown';
+
+function streakHeader(c) {
+  return `Customer: <b>${esc(c.name || '-')}</b>${c.customerId ? ` (<code>${esc(c.customerId)}</code>)` : ''}\n` +
+    `Organisation: <b>${esc(c.org || '-')}</b>\n` +
+    (c.accountId ? `A/c: <code>${esc(c.accountId)}</code>\n` : '');
+}
+
+function streakText(wh, c, kind, count, limit, test) {
+  const [icon, word] = STREAK_TITLES[kind];
+  const rows = c.txns.slice(-limit).map((x, i) =>
+    `${i + 1}. <code>${esc(x.id)}</code> · ${inr(x.amount)} · ${fmtTime(x.time)}` +
+    (kind === 'pending' ? ` · ${esc(x.status)}` : '') +
+    (x.org && x.org !== c.org ? ` · ${esc(x.org)}` : '') +
+    `\n    Reason: ${esc(x.reason || 'not given')}`
+  ).join('\n');
+  return `${icon} <b>${count} ${word} transactions in a row</b>${test ? ' (test)' : ''}\n` +
+    streakHeader(c) +
+    `\n<b>${count > limit ? `Last ${limit}` : `All ${limit}`} ${word} transactions:</b>\n${rows}\n\n<i>via ${esc(wh.name)}</i>`;
+}
+
+function streakEndedText(wh, c, kind, latest) {
+  const what = kind === 'failed' ? 'Failures stopped' : 'Pending cleared';
+  return `✅ <b>${what}</b>\n` + streakHeader(c) +
+    `Latest txn <code>${esc(latest.id)}</code> is ${esc(latest.status)} · ${inr(latest.amount)} · ${fmtTime(latest.time)}\n<i>via ${esc(wh.name)}</i>`;
+}
+
+async function updateWebhookStreaks(wh, t, kind, summary) {
+  const limits = { failed: Number(wh.streak?.failed ?? 5), pending: Number(wh.streak?.pending ?? 5) };
+  if (!limits.failed && !limits.pending) return;
+
+  state.whStreaks ||= {};
+  const customers = (state.whStreaks[wh.id] ||= {});
+  const c = (customers[streakCustomerKey(t)] ||= { txns: [], alerted: {} });
+  if (t.customerName) c.name = t.customerName;
+  if (t.orgName) c.org = t.orgName;
+  if (t.customerId) c.customerId = t.customerId;
+  if (t.accountId) c.accountId = t.accountId;
+  c.updatedAt = Date.now();
+
+  // one entry per transaction, in arrival order; a later update (pending → failed) changes it in place
+  const rec = { id: t.id, kind, status: t.status, amount: t.amount, reason: t.reason, time: t.time.toISOString(), org: t.orgName };
+  const i = c.txns.findIndex((x) => x.id === t.id);
+  if (i >= 0) c.txns[i] = { ...c.txns[i], ...rec, reason: t.reason || c.txns[i].reason };
+  else c.txns.push(rec);
+  c.txns = c.txns.slice(-50);
+
+  const trailing = (k) => {
+    let n = 0;
+    for (let j = c.txns.length - 1; j >= 0 && c.txns[j].kind === k; j--) n++;
+    return n;
+  };
+
+  const parts = [];
+  for (const k of ['failed', 'pending']) {
+    const limit = limits[k];
+    if (!limit) continue;
+    const n = trailing(k);
+    if (n) parts.push(`${k} ${n}/${limit}`);
+    if (n >= limit) {
+      // alert at N in a row, then again at 2N, 3N …
+      if (!c.alerted[k] || (n !== c.alerted[k] && (n - limit) % limit === 0)) {
+        await notifyTo(wh.chatIds, streakText(wh, c, k, n, limit));
+        c.alerted[k] = n;
+        summary.notified = true;
+        parts.push(`${k} streak alert sent`);
+      }
+    } else if (c.alerted[k]) {
+      await notifyTo(wh.chatIds, streakEndedText(wh, c, k, c.txns.at(-1)));
+      c.alerted[k] = 0;
+      parts.push(`${k} streak ended`);
+    }
+  }
+  if (parts.length) summary.streak = parts.join(' · ');
+
+  // keep the 2000 most recently active customers per webhook
+  const keys = Object.keys(customers);
+  if (keys.length > 2000) {
+    keys.sort((a, b) => customers[a].updatedAt - customers[b].updatedAt);
+    for (const k of keys.slice(0, keys.length - 2000)) delete customers[k];
+  }
+}
+
+// deliveries are handled one at a time, in arrival order, so streaks count correctly
+let webhookQueue = Promise.resolve();
 
 async function handleWebhookRecords(wh, payload, records, entry) {
   for (const r of records) {
@@ -681,6 +782,7 @@ async function handleWebhookRecords(wh, payload, records, entry) {
       await notifyTo(wh.chatIds, webhookText(wh, t, kind));
       summary.notified = true;
     }
+    await updateWebhookStreaks(wh, t, kind, summary);
     if (wh.feedStreaks && kind !== 'pending' && t.customerId && !state.seenTx[t.id]) {
       await processTransaction(t, kind === 'failed');
     }
@@ -688,7 +790,7 @@ async function handleWebhookRecords(wh, payload, records, entry) {
   forgetOldTransactions();
   saveState();
   console.log(`[WEBHOOK] ${wh.name}: ` + (entry.txns.map((s) =>
-    `${s.id || '?'} ${s.status || '?'}${s.notified ? ' → notified' : s.note ? ` (${s.note})` : ''}`).join(', ') || 'no transactions'));
+    `${s.id || '?'} ${s.status || '?'}${s.streak ? ` [${s.streak}]` : ''}${s.notified ? ' → notified' : s.note ? ` (${s.note})` : ''}`).join(', ') || 'no transactions'));
 }
 
 // called by the admin server for POST /webhook/:id[/:secret]
@@ -703,6 +805,13 @@ function receiveWebhook({ id, pathSecret, headers, rawBody, contentType }) {
     return { status: 401, body: { error: 'Unauthorized' } };
   }
 
+  // function switched off → accept (so the provider doesn't keep retrying) but do nothing
+  const fn = config.fn(wh.fnId);
+  if (!fn?.enabled) {
+    logDelivery(wh.id, { httpStatus: 200, note: `Ignored – function “${fn?.name || wh.fnId}” is switched off`, body: preview });
+    return { status: 200, body: { ok: true, ignored: 'function disabled' } };
+  }
+
   let payload;
   try {
     payload = parseWebhookBody(rawBody, contentType);
@@ -714,19 +823,39 @@ function receiveWebhook({ id, pathSecret, headers, rawBody, contentType }) {
   const records = webhookRecords(payload);
   const entry = logDelivery(wh.id, { httpStatus: 200, note: records.length ? '' : 'No transaction in payload', body: preview });
   // answer the provider right away; notifications are sent in the background
-  setImmediate(() => handleWebhookRecords(wh, payload, records, entry)
-    .catch((e) => console.error(`[WEBHOOK] ${wh.name} failed:`, e.message)));
+  webhookQueue = webhookQueue
+    .then(() => handleWebhookRecords(wh, payload, records, entry))
+    .catch((e) => console.error(`[WEBHOOK] ${wh.name} failed:`, e.message));
   return { status: 200, body: { ok: true, received: records.length } };
 }
 
 async function sendWebhookTest(id, kind) {
   const wh = config.webhook(id);
   if (!wh) throw new Error('Webhook not found');
+  // sample "5 in a row" alert
+  if (kind === 'failed_streak' || kind === 'pending_streak') {
+    const k = kind.split('_')[0];
+    const limit = Number(wh.streak?.[k]) || 5;
+    const reasons = k === 'failed'
+      ? ['Insufficient funds', 'Bank server down', 'Invalid account number', 'Limit exceeded', 'Timeout from bank']
+      : ['Awaiting bank confirmation', 'In bank queue', 'Beneficiary bank slow', 'Processing', 'Awaiting UTR'];
+    const c = {
+      name: 'Test Customer', customerId: 'CUST-TEST', org: 'Test Organisation Pvt Ltd', accountId: 'XXXX1234',
+      txns: Array.from({ length: limit }, (_, i) => ({
+        id: `TEST-${Date.now()}-${i + 1}`, kind: k, status: list(wh.statuses?.[k])[0] || k.toUpperCase(),
+        amount: 1000 * (i + 1), reason: reasons[i % reasons.length], time: new Date(Date.now() - (limit - i) * 60000).toISOString(),
+      })),
+    };
+    await notifyTo(wh.chatIds, streakText(wh, c, k, limit, limit, true));
+    logDelivery(wh.id, { httpStatus: 200, note: `Test “${limit} ${k} in a row” alert sent from the admin panel` });
+    return;
+  }
   if (!WEBHOOK_KINDS[kind]) throw new Error('Unknown type');
   const t = {
     id: `TEST-${Date.now()}`, customerId: 'CUST-TEST', customerName: 'Test Customer', accountId: 'XXXX1234',
     amount: 1234.5, status: list(wh.statuses?.[kind])[0] || kind.toUpperCase(),
-    reason: kind === 'failed' ? 'Test failure reason' : '', utr: '123456789012', mode: 'IMPS', time: new Date(),
+    reason: kind === 'failed' ? 'Test failure reason' : kind === 'pending' ? 'Awaiting bank confirmation' : '',
+    orgName: 'Test Organisation Pvt Ltd', utr: '123456789012', mode: 'IMPS', time: new Date(),
   };
   await notifyTo(wh.chatIds, webhookText(wh, t, kind, true));
   logDelivery(wh.id, { httpStatus: 200, note: `Test ${kind} notification sent from the admin panel`, txns: [{ id: t.id, status: t.status, kind, notified: true }] });
@@ -1256,7 +1385,7 @@ require('./admin').startAdmin({
       defaults: config.defaultWebhookStatuses(),
     }),
     upsert: (data) => { const id = config.upsertWebhook(data); refreshSecrets(); return id; },
-    remove: (id) => { config.deleteWebhook(id); deliveries.delete(id); refreshSecrets(); },
+    remove: (id) => { config.deleteWebhook(id); deliveries.delete(id); delete state.whStreaks?.[id]; saveState(); refreshSecrets(); },
     regenerateSecret: (id) => { config.regenerateWebhookSecret(id); refreshSecrets(); },
     test: sendWebhookTest,
   },
