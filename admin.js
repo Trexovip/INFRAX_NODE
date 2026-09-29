@@ -82,7 +82,7 @@ async function lookupLabel(bot, id) {
   }
 }
 
-function startAdmin({ port, host, user, password, trustProxy, getBot, access, runBalanceCheck, sendTest, chats, settings, functions }) {
+function startAdmin({ port, host, user, password, trustProxy, getBot, access, runBalanceCheck, sendTest, chats, settings, commands, functions }) {
   if (!password) {
     console.warn('ADMIN_PASSWORD not set – admin panel disabled');
     return null;
@@ -258,6 +258,25 @@ function startAdmin({ port, host, user, password, trustProxy, getBot, access, ru
           console.log(`[ADMIN] ${session.user} changed the Telegram bot token (now @${info?.username})`);
           return json(res, 200, { ok: true, bot: info });
         }
+      }
+
+      // --- commands (built-in names/descriptions/on-off + function on-off) ---
+      // GET /api/commands
+      if (req.method === 'GET' && parts[1] === 'commands' && parts.length === 2) return json(res, 200, commands.view());
+
+      // POST /api/commands/:key  { command, description, enabled }
+      if (req.method === 'POST' && parts[1] === 'commands' && parts.length === 3) {
+        const c = commands.update(parts[2], await readBody(req));
+        console.log(`[ADMIN] ${session.user} updated command /${c.command} (${c.key}): ${c.enabled ? 'active' : 'inactive'}`);
+        return json(res, 200, c);
+      }
+
+      // POST /api/functions/:id/enabled  { enabled }
+      if (req.method === 'POST' && parts[1] === 'functions' && parts[3] === 'enabled' && parts.length === 4) {
+        const { enabled } = await readBody(req);
+        commands.setFunctionEnabled(parts[2], enabled);
+        console.log(`[ADMIN] ${session.user} ${enabled ? 'activated' : 'deactivated'} function ${parts[2]}`);
+        return json(res, 200, { ok: true });
       }
 
       // --- functions (each with a master key and APIs) ---
