@@ -58,7 +58,7 @@ function writeJson(file, data) {
   fs.renameSync(tmp, file);
 }
 
-// Bot token, API credentials, API endpoints, auto-clear – editable in the admin panel
+// Bot token, functions (APIs + keys), auto-clear – editable in the admin panel
 const config = createConfigStore({ file: dataFile('CONFIG_FILE', 'config.json'), env: process.env, writeJson });
 const refreshSecrets = () => logger.setSecrets([...config.secrets(), process.env.ADMIN_PASSWORD]);
 refreshSecrets();
@@ -307,17 +307,24 @@ const acctLines = (a) =>
   `A/c No: <code>${esc(a.accountNumber || a.accountId)}</code>\n`;
 
 // ---------------------------------------------------------------------------
-// API endpoints (configured in the admin panel, each with its own credentials)
+// API calls. Every API belongs to a function (admin panel → Functions) and uses
+// that function's master key, its own key, or no key.
 // ---------------------------------------------------------------------------
-const endpointsOf = (type) => config.get().endpoints.filter((e) => e.type === type && e.enabled);
-
-function apiGet(endpoint, params) {
-  const headers = { 'Content-Type': 'application/json' };
-  const cred = config.credentialFor(endpoint);
-  if (cred?.keyHeader && cred.key) headers[cred.keyHeader] = cred.key;
-  if (cred?.secretHeader && cred.secret) headers[cred.secretHeader] = cred.secret;
-  return axios.get(endpoint.url, { params, headers, timeout: 20000 });
+function apiRequest(fn, api, params = {}) {
+  const headers = { 'Content-Type': 'application/json', ...config.authHeaders(fn, api) };
+  return api.method === 'POST'
+    ? axios.post(api.url, params, { headers, timeout: 20000 })
+    : axios.get(api.url, { params, headers, timeout: 20000 });
 }
+
+// enabled APIs of a built-in function ('balance' | 'transactions'), each tagged with its function
+function endpointsOf(builtinId) {
+  const fn = config.fn(builtinId);
+  if (!fn?.enabled) return [];
+  return fn.apis.filter((a) => a.enabled).map((a) => ({ ...a, fn }));
+}
+
+const apiGet = (ep, params) => apiRequest(ep.fn, ep, params);
 
 // ---------------------------------------------------------------------------
 // Telegram bot (can be started / swapped at runtime from the admin panel)
@@ -546,6 +553,132 @@ async function checkTransactions() {
 }
 
 // ---------------------------------------------------------------------------
+// Custom functions – Telegram commands + optional threshold monitors, defined
+// in the admin panel. Each API returns one number (a field, an item count or a sum).
+// ---------------------------------------------------------------------------
+const OPS = {
+  '<': (a, b) => a < b, '<=': (a, b) => a <= b, '>': (a, b) => a > b,
+  '>=': (a, b) => a >= b, '==': (a, b) => a === b, '!=': (a, b) => a !== b,
+};
+
+const getPath = (obj, p) => (p ? p.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj) : obj);
+
+// query values may use {now} {today} {1h_ago} {24h_ago}
+function fillPlaceholders(s) {
+  const now = new Date();
+  const values = {
+    now: now.toISOString(),
+    today: now.toLocaleDateString('en-CA', { timeZone: cfg.timezone }),
+    '1h_ago': new Date(now - 3600e3).toISOString(),
+    '24h_ago': new Date(now - 86400e3).toISOString(),
+  };
+  return s.replace(/\{(now|today|1h_ago|24h_ago)\}/g, (_, k) => values[k]);
+}
+
+function customParams(api, arg) {
+  const params = Object.fromEntries(new URLSearchParams(api.query || ''));
+  for (const k of Object.keys(params)) params[k] = fillPlaceholders(params[k]);
+  if (api.argParam && arg) params[api.argParam] = arg;
+  return params;
+}
+
+function extractValue(api, data) {
+  if (api.valueMode === 'count' || api.valueMode === 'sum') {
+    const target = api.valuePath ? getPath(data, api.valuePath) : data;
+    const items = Array.isArray(target) ? target : extractList(target);
+    if (api.valueMode === 'count') return items.length;
+    return items.reduce((sum, r) => sum + (Number(getPath(r, api.sumField)) || 0), 0);
+  }
+  const v = Number(getPath(data, api.valuePath));
+  if (!Number.isFinite(v)) throw new Error(`"${api.valuePath}" is not a number in the API response`);
+  return v;
+}
+
+async function runCustomApi(fn, api, arg) {
+  const res = await apiRequest(fn, api, customParams(api, arg));
+  return extractValue(api, res.data);
+}
+
+const fmtValue = (fn, v) => (fn.format === 'inr' ? inr(v) : Number(v).toLocaleString('en-IN'));
+const condText = (fn) => `value ${fn.monitor.op} ${fmtValue(fn, fn.monitor.threshold)}`;
+const isTriggered = (fn, v) => !!OPS[fn.monitor?.op]?.(v, Number(fn.monitor.threshold));
+
+async function runFunctionCommand(msg, fn, arg) {
+  const apis = fn.apis.filter((a) => a.enabled);
+  if (!apis.length) return send(msg.chat.id, `⚠️ <b>${esc(fn.name)}</b> has no APIs configured.`);
+  const lines = await Promise.all(apis.map(async (api) => {
+    const prefix = apis.length > 1 ? `• ${esc(api.name)}: ` : 'Value: ';
+    try {
+      const v = await runCustomApi(fn, api, arg);
+      const flag = fn.monitor?.enabled ? (isTriggered(fn, v) ? ' 🔴' : ' 🟢') : '';
+      return `${prefix}<b>${fmtValue(fn, v)}</b>${flag}`;
+    } catch (e) {
+      return `${prefix}❌ <code>${esc(e.response ? `HTTP ${e.response.status}` : e.message)}</code>`;
+    }
+  }));
+  return send(msg.chat.id,
+    `📊 <b>${esc(fn.name)}</b>${arg ? ` – ${esc(arg)}` : ''}\n${lines.join('\n')}` +
+    (fn.monitor?.enabled ? `\n<i>Alerts when ${esc(condText(fn))}</i>` : '') +
+    `\n<i>As of ${fmtTime(Date.now())}</i>`);
+}
+
+// monitor: alert once when the condition becomes true, remind, and send recovery
+async function checkFunction(fn) {
+  const now = Date.now();
+  state.fnAlerts ||= {};
+  state.fnLastRun ||= {};
+  state.fnLastRun[fn.id] = now;
+  const apis = fn.apis.filter((a) => a.enabled);
+  for (const api of apis) {
+    const key = `${fn.id}:${api.id}`;
+    let v;
+    try {
+      v = await runCustomApi(fn, api);
+      await trackApiHealth({ id: key, name: `${fn.name} – ${api.name}` }, true);
+    } catch (e) {
+      await trackApiHealth({ id: key, name: `${fn.name} – ${api.name}` }, false, e);
+      continue;
+    }
+    const active = state.fnAlerts[key];
+    const apiLine = apis.length > 1 ? `API: ${esc(api.name)}\n` : '';
+    if (isTriggered(fn, v)) {
+      const remindMs = (fn.monitor.remindMin || 0) * 60000;
+      if (!active || (remindMs > 0 && now - active.lastAlert >= remindMs)) {
+        await notify(
+          `${active ? '🔁' : '⚠️'} <b>${esc(fn.name)}</b>${active ? ' (reminder)' : ''}\n` + apiLine +
+          `Value: <b>${fmtValue(fn, v)}</b>\nAlert when: ${esc(condText(fn))}` +
+          (active ? `\nSince: ${fmtTime(active.since)}` : ''));
+        state.fnAlerts[key] = { since: active?.since || now, lastAlert: now, value: v };
+      } else {
+        active.value = v;
+      }
+    } else if (active) {
+      await notify(`✅ <b>${esc(fn.name)}</b> back to normal\n` + apiLine + `Value: <b>${fmtValue(fn, v)}</b>`);
+      delete state.fnAlerts[key];
+    }
+  }
+  saveState();
+}
+
+const fnRunning = new Set();
+
+function functionsTick() {
+  const fns = config.customFunctions();
+  // forget alerts of deleted/disabled functions and APIs
+  const live = new Set(fns.filter((f) => f.enabled && f.monitor?.enabled).flatMap((f) => f.apis.filter((a) => a.enabled).map((a) => `${f.id}:${a.id}`)));
+  for (const k of Object.keys(state.fnAlerts || {})) if (!live.has(k)) delete state.fnAlerts[k];
+
+  for (const fn of fns) {
+    if (!fn.enabled || !fn.monitor?.enabled || fnRunning.has(fn.id)) continue;
+    if (Date.now() - (state.fnLastRun?.[fn.id] || 0) < fn.monitor.everyMin * 60000) continue;
+    fnRunning.add(fn.id);
+    checkFunction(fn)
+      .catch((e) => console.error(`Function ${fn.name} crashed:`, e))
+      .finally(() => fnRunning.delete(fn.id));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Chat clearing – deletes messages the bot sent and the commands it handled.
 // Telegram only allows bots to delete messages younger than 48 hours.
 // ---------------------------------------------------------------------------
@@ -675,17 +808,60 @@ const who = (msg) => {
   return `${name ? name + ' ' : ''}(${u.id}) in chat ${msg.chat.id}`;
 };
 
-const HELP =
-  `<b>Internal Monitoring Bot</b>\n\n` +
-  `/status – bot health & thresholds\n` +
-  `/balance – all account balances\n` +
-  `/balance &lt;search&gt; or /bal &lt;search&gt; – live balance of a specific account\n` +
-  `   e.g. /bal 7854  ·  /bal Deepak  ·  /bal 786543214567854\n` +
-  `/low – accounts below threshold\n` +
-  `/failures – customers with active failure streaks\n` +
-  `/check – run both checks now\n` +
-  `/clear – delete the bot's messages in this chat\n` +
-  `/id – show chat/user ID`;
+const BUILTIN_COMMANDS = [
+  { command: 'status', description: 'Bot health & thresholds' },
+  { command: 'balance', description: 'All account balances' },
+  { command: 'bal', description: 'Live balance of an account – /bal 7854' },
+  { command: 'low', description: 'Accounts below threshold' },
+  { command: 'failures', description: 'Customers with active failure streaks' },
+  { command: 'check', description: 'Run balance & transaction checks now' },
+  { command: 'clear', description: "Delete the bot's messages in this chat" },
+  { command: 'id', description: 'Show chat/user ID' },
+];
+
+const activeCustomFunctions = () => config.customFunctions().filter((f) => f.enabled);
+
+function helpText() {
+  const custom = activeCustomFunctions().map((f) => `/${f.command} – ${esc(f.description || f.name)}`).join('\n');
+  return `<b>Internal Monitoring Bot</b>\n\n` +
+    `/status – bot health & thresholds\n` +
+    `/balance – all account balances\n` +
+    `/balance &lt;search&gt; or /bal &lt;search&gt; – live balance of a specific account\n` +
+    `   e.g. /bal 7854  ·  /bal Deepak  ·  /bal 786543214567854\n` +
+    `/low – accounts below threshold\n` +
+    `/failures – customers with active failure streaks\n` +
+    `/check – run both checks now\n` +
+    `/clear – delete the bot's messages in this chat\n` +
+    `/id – show chat/user ID` +
+    (custom ? `\n\n<b>Functions</b>\n${custom}` : '');
+}
+
+// keep Telegram's "/" command menu in sync with the functions
+function syncBotCommands() {
+  if (!bot) return;
+  const commands = [
+    ...BUILTIN_COMMANDS,
+    ...activeCustomFunctions().map((f) => ({ command: f.command, description: (f.description || f.name).slice(0, 256) })),
+  ];
+  bot.setMyCommands(commands).catch((e) => console.error('Could not update bot command menu:', e.message));
+}
+
+// access check + logging for every command
+async function guarded(msg, handler) {
+  trackMessage(msg.chat.id, msg.message_id, msg.date * 1000);
+  if (!isAllowed(msg)) {
+    console.warn(`[DENIED] ${who(msg)}: ${msg.text}`);
+    recordAccessRequest(msg);
+    return send(msg.chat.id, '⛔ Not authorised. Send /id and ask admin to whitelist you.');
+  }
+  console.log(`[CMD] ${who(msg)}: ${msg.text}`);
+  try {
+    await handler();
+  } catch (e) {
+    console.error(`[CMD] ${msg.text} failed:`, e.message);
+    await send(msg.chat.id, `Error: ${esc(e.message)}`);
+  }
+}
 
 // /bal <account no | last digits | name | bank | id>  -> live lookup from all balance APIs
 async function balanceLookup(msg, q) {
@@ -718,43 +894,40 @@ async function balanceLookup(msg, q) {
 }
 
 function registerHandlers(b) {
-  function command(regex, handler) {
-    b.onText(regex, async (msg, match) => {
-      trackMessage(msg.chat.id, msg.message_id, msg.date * 1000);
-      if (!isAllowed(msg)) {
-        console.warn(`[DENIED] ${who(msg)}: ${msg.text}`);
-        recordAccessRequest(msg);
-        return send(msg.chat.id, '⛔ Not authorised. Send /id and ask admin to whitelist you.');
-      }
-      console.log(`[CMD] ${who(msg)}: ${msg.text}`);
-      try {
-        await handler(msg, match);
-      } catch (e) {
-        console.error(`[CMD] ${msg.text} failed:`, e.message);
-        await send(msg.chat.id, `Error: ${esc(e.message)}`);
-      }
-    });
-  }
+  const command = (regex, handler) => b.onText(regex, (msg, match) => guarded(msg, () => handler(msg, match)));
+
+  // custom functions from the admin panel – looked up per message, so new ones work immediately
+  b.onText(/^\/([A-Za-z0-9_]{1,32})(?:@\w+)?(?:\s+([\s\S]+))?$/, (msg, match) => {
+    const fn = activeCustomFunctions().find((f) => f.command === match[1].toLowerCase());
+    if (!fn) return;
+    return guarded(msg, () => runFunctionCommand(msg, fn, (match[2] || '').trim()));
+  });
 
   // /id works for everyone so you can find chat IDs during setup
-  b.onText(/^\/id/, (msg) => {
+  b.onText(/^\/id(?:@\w+)?(?:\s|$)/, (msg) => {
     trackMessage(msg.chat.id, msg.message_id, msg.date * 1000);
     if (!isAllowed(msg)) recordAccessRequest(msg);
     return send(msg.chat.id, `Chat ID: <code>${msg.chat.id}</code>\nYour user ID: <code>${msg.from?.id}</code>`);
   });
 
-  command(/^\/(start|help)/, (msg) => send(msg.chat.id, HELP));
+  command(/^\/(start|help)(?:@\w+)?(?:\s|$)/, (msg) => send(msg.chat.id, helpText()));
 
-  command(/^\/status/, (msg) => {
-    const apis = config.get().endpoints.map((e) =>
-      `• ${esc(e.name)} (${e.type})${e.enabled ? '' : ' – disabled'}${state.apiErrors[e.id] ? ` – ${state.apiErrors[e.id]} error(s)` : ''}`
-    ).join('\n') || '• none configured';
+  command(/^\/status(?:@\w+)?(?:\s|$)/, (msg) => {
+    const apis = config.get().functions.map((f) => {
+      const rows = f.apis.map((a) => {
+        const errs = state.apiErrors[f.builtin ? a.id : `${f.id}:${a.id}`];
+        return `   • ${esc(a.name)}${a.enabled ? '' : ' – disabled'}${errs ? ` – ${errs} error(s)` : ''}`;
+      });
+      const alerts = Object.keys(state.fnAlerts || {}).filter((k) => k.startsWith(f.id + ':')).length;
+      return `${f.enabled ? '🟢' : '⚪️'} ${esc(f.name)}${f.builtin ? '' : ` (/${f.command})`}${alerts ? ` – ${alerts} alert(s) active` : ''}\n` +
+        (rows.join('\n') || '   • no APIs');
+    }).join('\n');
     const ac = config.get().autoClear;
     return send(msg.chat.id,
       `<b>Status</b>\n` +
       `Last balance check: ${state.lastBalanceCheck ? fmtTime(state.lastBalanceCheck) : 'never'}\n` +
       `Last txn check: ${state.lastTxnCheck ? fmtTime(state.lastTxnCheck) : 'never'}\n\n` +
-      `<b>APIs</b>\n${apis}\n\n` +
+      `<b>Functions</b>\n${apis}\n\n` +
       `Balance threshold: ${inr(cfg.balanceThreshold)} (${lakh(cfg.balanceThreshold)})\n` +
       `Failure alert after: ${cfg.failThreshold} consecutive fails\n` +
       `Accounts tracked: ${Object.keys(state.balances).length}\n` +
@@ -784,7 +957,7 @@ function registerHandlers(b) {
     return send(msg.chat.id, `<b>Balances</b> (lowest first)\n\n${text}`);
   });
 
-  command(/^\/low/, (msg) => {
+  command(/^\/low(?:@\w+)?(?:\s|$)/, (msg) => {
     const rows = Object.entries(state.lowBalance);
     if (!rows.length) return send(msg.chat.id, '✅ All accounts above threshold.');
     const text = rows.map(([id, l]) => {
@@ -794,7 +967,7 @@ function registerHandlers(b) {
     return send(msg.chat.id, `<b>Low Balance Accounts</b>\n\n${text}`);
   });
 
-  command(/^\/failures/, (msg) => {
+  command(/^\/failures(?:@\w+)?(?:\s|$)/, (msg) => {
     const rows = Object.entries(state.streaks).filter(([, s]) => s.count > 0).sort((a, b) => b[1].count - a[1].count);
     if (!rows.length) return send(msg.chat.id, '✅ No active failure streaks.');
     const text = rows.map(([id, s]) =>
@@ -804,13 +977,13 @@ function registerHandlers(b) {
     return send(msg.chat.id, `<b>Failure Streaks</b>\n\n${text}`);
   });
 
-  command(/^\/check/, async (msg) => {
+  command(/^\/check(?:@\w+)?(?:\s|$)/, async (msg) => {
     await send(msg.chat.id, '⏳ Running checks...');
     await Promise.all([checkBalances(), checkTransactions()]);
     await send(msg.chat.id, '✅ Checks complete. Use /status for details.');
   });
 
-  command(/^\/clear/, async (msg) => {
+  command(/^\/clear(?:@\w+)?(?:\s|$)/, async (msg) => {
     const r = await clearChats({ chatId: msg.chat.id, reason: `/clear by ${who(msg)}` });
     if (r.failed) await send(msg.chat.id, `🧹 Cleared ${r.deleted} message(s). ${r.failed} could not be deleted (older than 48h, or the bot is not a group admin).`);
   });
@@ -836,6 +1009,7 @@ async function startBot(token) {
   botInfo = { id: me.id, username: me.username, name: me.first_name };
   await b.startPolling();
   console.log(`🤖 Telegram bot @${me.username} connected`);
+  syncBotCommands();
   return botInfo;
 }
 
@@ -857,11 +1031,12 @@ async function changeBotToken(token) {
 startBot(config.get().telegram.botToken).catch((e) =>
   console.error('Could not start Telegram bot:', e.response?.body?.description || e.message, '– check the token in the admin panel'));
 
-if (!endpointsOf('balance').length) console.warn('⚠ No balance API configured – add one in the admin panel (Settings tab)');
-if (!endpointsOf('transactions').length) console.warn('⚠ No transactions API configured – add one in the admin panel (Settings tab)');
+if (!endpointsOf('balance').length) console.warn('⚠ No balance API configured – add one in the admin panel (Functions tab)');
+if (!endpointsOf('transactions').length) console.warn('⚠ No transactions API configured – add one in the admin panel (Functions tab)');
 
 schedule('balance', checkBalances, cfg.balancePollSec);
 schedule('transactions', checkTransactions, cfg.txnPollSec);
+setInterval(functionsTick, 20 * 1000);
 setInterval(() => autoClearTick().catch((e) => console.error('Auto-clear failed:', e.message)), 30 * 1000);
 
 require('./admin').startAdmin({
@@ -874,7 +1049,7 @@ require('./admin').startAdmin({
   access: accessStore,
 
   runBalanceCheck: () => {
-    if (!endpointsOf('balance').length) throw new Error('No enabled balance API – add one in Settings');
+    if (!endpointsOf('balance').length) throw new Error('No enabled balance API – add one in Functions → Balance check');
     return checkBalances();
   },
 
@@ -891,20 +1066,41 @@ require('./admin').startAdmin({
   },
 
   settings: {
-    view: () => ({ ...config.publicView(), bot: botInfo, timezone: cfg.timezone }),
+    view: () => ({ telegram: config.publicTelegram(), bot: botInfo, timezone: cfg.timezone }),
     setBotToken: changeBotToken,
-    upsertCredential: (data) => { const id = config.upsertCredential(data); refreshSecrets(); return id; },
-    deleteCredential: (id) => { config.deleteCredential(id); refreshSecrets(); },
-    upsertEndpoint: (data) => config.upsertEndpoint(data),
-    deleteEndpoint: (id) => config.deleteEndpoint(id),
+  },
+
+  functions: {
+    view: () => ({ functions: config.publicFunctions(), activeAlerts: state.fnAlerts || {}, lastRun: state.fnLastRun || {} }),
+    upsert: (data) => { const id = config.upsertFunction(data); refreshSecrets(); syncBotCommands(); return id; },
+    remove: (id) => { config.deleteFunction(id); refreshSecrets(); syncBotCommands(); },
+    upsertApi: (fnId, data) => { const id = config.upsertApi(fnId, data); refreshSecrets(); return id; },
+    removeApi: (fnId, apiId) => { config.deleteApi(fnId, apiId); refreshSecrets(); },
+
     // call an API once and report what came back
-    async testEndpoint(id) {
-      const ep = config.get().endpoints.find((e) => e.id === id);
-      if (!ep) throw new Error('API not found');
+    async testApi(fnId, apiId) {
+      const fn = config.fn(fnId);
+      const api = fn?.apis.find((a) => a.id === apiId);
+      if (!api) throw new Error('API not found');
       const started = Date.now();
-      const res = await apiGet(ep, ep.type === 'transactions' ? txnParams(ep, started) : undefined);
+      const params = fn.builtin === 'transactions' ? txnParams(api, started) : fn.builtin ? undefined : customParams(api);
+      const res = await apiRequest(fn, api, params);
       const items = extractList(res.data);
-      return { status: res.status, ms: Date.now() - started, items: items.length, fields: Object.keys(items[0] || {}).slice(0, 25) };
+      const sample = items[0] || (res.data && typeof res.data === 'object' ? res.data : {});
+      const out = { status: res.status, ms: Date.now() - started, items: items.length, fields: Object.keys(sample).slice(0, 25) };
+      if (!fn.builtin) out.value = fmtValue(fn, extractValue(api, res.data));
+      return out;
+    },
+
+    // run a custom function's monitor now
+    async runNow(fnId) {
+      const fn = config.fn(fnId);
+      if (!fn || fn.builtin) throw new Error('Function not found');
+      if (!fn.monitor?.enabled) throw new Error('Turn on alerts for this function first (or use Test on an API)');
+      if (fnRunning.has(fn.id)) throw new Error('This function is already running');
+      fnRunning.add(fn.id);
+      try { await checkFunction(fn); } finally { fnRunning.delete(fn.id); }
+      return state.fnAlerts || {};
     },
   },
 });
