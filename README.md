@@ -10,10 +10,10 @@
    ADMIN_PASSWORD=choose-a-strong-password
    ```
 5. `npm start`, open http://localhost:3000 and sign in.
-6. **Settings** tab: paste the bot token. **Functions** tab: set the master key and add APIs to *Balance check* and *Transaction failures*, and create your own functions.
+6. **Settings** tab: paste the bot token. **Functions** tab: set the master key and add APIs to *Balance check*, give your vendor the *Transaction failures* Incoming URL, and create your own functions.
 7. Send `/id` in the group and add that chat under **Access → Alert chats** (or approve it from Access requests).
 
-Existing `.env` values (`TELEGRAM_BOT_TOKEN`, `TREXO_KEY`, `TREXO_SECRET`, `BALANCE_API_URL`, `TXN_API_URL`, `ALERT_CHAT_IDS`, `ALLOWED_USER_IDS`) are imported automatically on first start. After that the admin panel is the source of truth.
+Existing `.env` values (`TELEGRAM_BOT_TOKEN`, `TREXO_KEY`, `TREXO_SECRET`, `BALANCE_API_URL`, `ALERT_CHAT_IDS`, `ALLOWED_USER_IDS`) are imported automatically on first start. After that the admin panel is the source of truth.
 
 ## Data files
 Everything the panel changes is stored in `DATA_DIR` (default: the project folder):
@@ -22,7 +22,7 @@ Everything the panel changes is stored in `DATA_DIR` (default: the project folde
 |---|---|
 | `config.json` | bot token, functions (APIs and keys), auto-clear settings – **contains secrets** |
 | `access.json` | alert chats, allowed users, blocked accounts, access requests |
-| `state.json` | alert state, balances, message IDs for chat clearing |
+| `state.json` | alert state, balances, customers failed/pending in a row, message IDs for chat clearing |
 | `logs.jsonl` | logs shown in the Logs tab |
 
 These are in `.gitignore` – never commit them. On Railway, add a Volume mounted at `/data` and set `DATA_DIR=/data`, otherwise everything is lost on each deploy.
@@ -61,7 +61,8 @@ TIMEZONE=Asia/Kolkata                     # used for daily auto-clear time and m
 A function is a set of APIs with its own **master key**. Each API uses the function's master key, its own separate key, or no key. Key header names are configurable (default `x-trexo-key` / `x-trexo-secret`). Keys are only ever shown masked; leave key fields blank when editing to keep them.
 
 - **Balance check** (built-in) – its APIs feed low-balance alerts and `/bal`, `/balance`, `/low`. Add several and the accounts are combined.
-- **Transaction failures** (built-in) – its APIs feed failure-streak alerts and `/failures`.
+- **Transaction failures** (built-in) – no API: your vendor **sends** every failed and pending transaction to the function's **Incoming URL** (`https://<your-domain>/incoming/<random>` – shown in the card with a Copy button; no secret needed, keep it private; **New URL** replaces it). When a customer has **5 failed in a row** (configurable, 0 = off) one alert lists the customer name, organisation and all 5 transactions with ID, amount, time and failure reason; the same for **5 pending in a row** with the pending reasons. Repeats at 10, 15 …; a “Failures stopped” / “Pending cleared” message follows when the customer's latest transaction is no longer failed / pending. Vendor retries are counted once, blocked accounts are skipped, and switching the function off makes the URL accept but ignore deliveries. The card also shows the customers currently in a row, the last 25 deliveries with their raw payload, and **Test** buttons. `/failures` lists the current streaks.
+  - Fields read from each transaction: ID (`txn_id` / `transaction_id` / `id`), customer (`customer_id`, `customer_name`), organisation (`organisation_name` / `organization_name` / `org_name` / `merchant_name` …), amount, status (`status` / `txn_status`, or the event name like `payment.failed`), reason (`failure_reason` / `pending_reason` / `reason` / `status_message` / `remarks` …). The body may be the transaction itself, a list, or wrapped in `data` / `transaction` / `payload`.
 - **Custom functions** – click **+ New function**:
   - **Telegram command**, e.g. `trxn_wezbo` → `/trxn_wezbo` in Telegram. It appears in `/help` and the bot's command menu.
   - **APIs**: URL, GET/POST, optional query parameters (placeholders `{today}`, `{now}`, `{1h_ago}`, `{24h_ago}`), and which value to read: a number field (`data.count`), the number of items in a list, or the sum of a field across a list. Optionally pass the command text as a parameter (`/trxn_wezbo acme` → `?merchant=acme`).
@@ -91,11 +92,12 @@ pm2 save && pm2 startup
 ```
 
 ## Adapting to your API
-Edit `mapBalance()` and `mapTransaction()` in `index.js` so the field names match your API response. Use **Test** on an API in the Functions tab to see which fields it returns.
+Edit `mapBalance()` (balance API) and `mapTransaction()` (vendor transactions) in `index.js` if your field names differ. Use **Test** on an API in the Functions tab, or *Recent deliveries* in the Transaction failures card, to see which fields arrive.
 
 ## Alerts
-- 🚨 Customer has FAIL_THRESHOLD+ failed transactions in a row (repeats every FAIL_REPEAT_EVERY more failures)
-- ✅ Recovery when that customer gets a successful transaction
+- 🚨 Customer has N failed transactions in a row (vendor → Incoming URL; N set in the panel, default 5)
+- ⏳ Customer has N pending transactions in a row
+- ✅ Failures stopped / pending cleared when the customer's latest transaction changes
 - ⚠️ Account balance below BALANCE_THRESHOLD (reminder every BALANCE_REMIND_MINUTES)
 - ✅ Balance restored
 - 🔴 API not responding (per API)
