@@ -1,6 +1,6 @@
 /**
  * Admin panel – web UI to manage alert chats, allowed users, blocked accounts, chat clearing,
- * bot token / API credentials / API endpoints, and view logs.
+ * bot token, functions (APIs with master/own keys, commands, monitors), and view logs.
  * Built on Node's http module (no extra dependencies). Login with user ID + password
  * (ADMIN_USER / ADMIN_PASSWORD) creates a session cookie.
  */
@@ -82,7 +82,7 @@ async function lookupLabel(bot, id) {
   }
 }
 
-function startAdmin({ port, host, user, password, trustProxy, getBot, access, runBalanceCheck, sendTest, chats, settings }) {
+function startAdmin({ port, host, user, password, trustProxy, getBot, access, runBalanceCheck, sendTest, chats, settings, functions }) {
   if (!password) {
     console.warn('ADMIN_PASSWORD not set – admin panel disabled');
     return null;
@@ -246,7 +246,7 @@ function startAdmin({ port, host, user, password, trustProxy, getBot, access, ru
         return json(res, 200, ac);
       }
 
-      // --- settings (bot token, API credentials, API endpoints) ---
+      // --- settings (bot token) ---
       if (parts[1] === 'settings') {
         // GET /api/settings
         if (req.method === 'GET' && parts.length === 2) return json(res, 200, settings.view());
@@ -258,41 +258,56 @@ function startAdmin({ port, host, user, password, trustProxy, getBot, access, ru
           console.log(`[ADMIN] ${session.user} changed the Telegram bot token (now @${info?.username})`);
           return json(res, 200, { ok: true, bot: info });
         }
+      }
 
-        // POST /api/settings/credentials  { id?, name, key, secret, keyHeader, secretHeader }
-        if (req.method === 'POST' && parts[2] === 'credentials' && parts.length === 3) {
+      // --- functions (each with a master key and APIs) ---
+      if (parts[1] === 'functions') {
+        const [, , fnId, sub, apiId, action] = parts;
+
+        // GET /api/functions
+        if (req.method === 'GET' && parts.length === 2) return json(res, 200, functions.view());
+
+        // POST /api/functions  { id?, name, command, description, enabled, master, monitor, format }
+        if (req.method === 'POST' && parts.length === 2) {
           const body = await readBody(req);
-          const id = settings.upsertCredential(body);
-          console.log(`[ADMIN] ${session.user} ${body.id ? 'updated' : 'added'} API credentials "${String(body.name || '').slice(0, 60)}"`);
+          const id = functions.upsert(body);
+          console.log(`[ADMIN] ${session.user} ${body.id ? 'updated' : 'created'} function "${String(body.name || '').slice(0, 60)}"`);
           return json(res, 200, { ok: true, id });
         }
 
-        // DELETE /api/settings/credentials/:id
-        if (req.method === 'DELETE' && parts[2] === 'credentials' && parts.length === 4) {
-          settings.deleteCredential(parts[3]);
-          console.log(`[ADMIN] ${session.user} deleted API credentials ${parts[3]}`);
+        // DELETE /api/functions/:id
+        if (req.method === 'DELETE' && parts.length === 3) {
+          functions.remove(fnId);
+          console.log(`[ADMIN] ${session.user} deleted function ${fnId}`);
           return json(res, 200, { ok: true });
         }
 
-        // POST /api/settings/endpoints  { id?, name, type, url, credentialId, enabled, sinceParam }
-        if (req.method === 'POST' && parts[2] === 'endpoints' && parts.length === 3) {
+        // POST /api/functions/:id/run  – run the monitor now
+        if (req.method === 'POST' && sub === 'run' && parts.length === 4) {
+          console.log(`[ADMIN] ${session.user} ran function ${fnId}`);
+          await functions.runNow(fnId);
+          return json(res, 200, { ok: true });
+        }
+
+        // POST /api/functions/:id/apis  { id?, name, url, keyMode, key, secret, ... }
+        if (req.method === 'POST' && sub === 'apis' && parts.length === 4) {
           const body = await readBody(req);
-          const id = settings.upsertEndpoint(body);
-          console.log(`[ADMIN] ${session.user} ${body.id ? 'updated' : 'added'} ${body.type} API "${String(body.name || '').slice(0, 60)}"`);
+          const id = functions.upsertApi(fnId, body);
+          console.log(`[ADMIN] ${session.user} ${body.id ? 'updated' : 'added'} API "${String(body.name || '').slice(0, 60)}" in function ${fnId}`);
           return json(res, 200, { ok: true, id });
         }
 
-        // DELETE /api/settings/endpoints/:id
-        if (req.method === 'DELETE' && parts[2] === 'endpoints' && parts.length === 4) {
-          settings.deleteEndpoint(parts[3]);
-          console.log(`[ADMIN] ${session.user} deleted API ${parts[3]}`);
+        // DELETE /api/functions/:id/apis/:apiId
+        if (req.method === 'DELETE' && sub === 'apis' && parts.length === 5) {
+          functions.removeApi(fnId, apiId);
+          console.log(`[ADMIN] ${session.user} deleted API ${apiId} from function ${fnId}`);
           return json(res, 200, { ok: true });
         }
 
-        // POST /api/settings/endpoints/:id/test
-        if (req.method === 'POST' && parts[2] === 'endpoints' && parts[4] === 'test' && parts.length === 5) {
+        // POST /api/functions/:id/apis/:apiId/test
+        if (req.method === 'POST' && sub === 'apis' && action === 'test' && parts.length === 6) {
           try {
-            return json(res, 200, { ok: true, ...(await settings.testEndpoint(parts[3])) });
+            return json(res, 200, { ok: true, ...(await functions.testApi(fnId, apiId)) });
           } catch (e) {
             const status = e.response?.status;
             return json(res, 200, { ok: false, error: status ? `HTTP ${status}: ${e.message}` : e.message });
