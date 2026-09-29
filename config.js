@@ -16,7 +16,19 @@ const newId = () => crypto.randomBytes(4).toString('hex');
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const HEADER_RE = /^[A-Za-z0-9-]{0,60}$/;
 const OPS = ['<', '<=', '>', '>=', '==', '!='];
-const RESERVED_COMMANDS = new Set(['start', 'help', 'status', 'bal', 'balance', 'low', 'failures', 'check', 'clear', 'id']);
+// Built-in bot commands. Name, description and on/off are editable in the admin panel;
+// `key` identifies what the command does and never changes.
+const BUILTIN_COMMANDS = [
+  { key: 'help', command: 'help', description: 'Show all commands', what: 'Lists every active command (also answers /start)', locked: true },
+  { key: 'status', command: 'status', description: 'Bot health & thresholds', what: 'Last checks, functions/APIs, thresholds, auto-clear' },
+  { key: 'balance', command: 'balance', description: 'All account balances (or add a search)', what: 'All tracked balances, lowest first; with text it searches' },
+  { key: 'bal', command: 'bal', description: 'Live balance of an account – e.g. 7854 or a name', what: 'Live lookup by account number, last digits, name or bank' },
+  { key: 'low', command: 'low', description: 'Accounts below threshold', what: 'Accounts currently under the low-balance threshold' },
+  { key: 'failures', command: 'failures', description: 'Customers with active failure streaks', what: 'Customers with consecutive failed transactions' },
+  { key: 'check', command: 'check', description: 'Run balance & transaction checks now', what: 'Runs the balance and transaction checks immediately' },
+  { key: 'clear', command: 'clear', description: "Delete the bot's messages in this chat", what: 'Deletes bot messages (under 48h) in the current chat' },
+  { key: 'id', command: 'id', description: 'Show chat/user ID', what: 'Replies with the chat ID and user ID – works for everyone, even without access' },
+];
 
 const emptyKey = () => ({ key: '', secret: '', keyHeader: 'x-trexo-key', secretHeader: 'x-trexo-secret' });
 const pickKey = (c) => ({ key: c.key || '', secret: c.secret || '', keyHeader: c.keyHeader ?? 'x-trexo-key', secretHeader: c.secretHeader ?? 'x-trexo-secret' });
@@ -133,7 +145,27 @@ function createConfigStore({ file, env, writeJson }) {
     return fn;
   };
 
-  const keyView = (k) => ({ keyHeader: k.keyHeader, secretHeader: k.secretHeader, keyHint: mask(k.key), secretHint: mask(k.secret) });
+  // built-in commands merged with the admin's overrides
+  const commands = () => BUILTIN_COMMANDS.map((d) => {
+    const saved = config.commands?.[d.key] || {};
+    return {
+      key: d.key, what: d.what, locked: !!d.locked, defaultCommand: d.command,
+      command: saved.command || d.command,
+      description: saved.description || d.description,
+      enabled: d.locked ? true : saved.enabled !== false,
+    };
+  });
+
+  // is /name free? (built-in names count even when switched off)
+  const assertCommandFree = (name, { key, fnId } = {}) => {
+    if (name === 'start') throw new Error('/start is reserved (it shows the help)');
+    const b = commands().find((c) => c.command === name && c.key !== key);
+    if (b) throw new Error(`/${name} is already used by the built-in “${b.what}” command`);
+    const f = config.functions.find((x) => !x.builtin && x.command === name && x.id !== fnId);
+    if (f) throw new Error(`/${name} is already used by the function “${f.name}”`);
+  };
+
+  const keyView = (k) =>({ keyHeader: k.keyHeader, secretHeader: k.secretHeader, keyHint: mask(k.key), secretHint: mask(k.secret) });
 
   return {
     get: () => config,
@@ -184,8 +216,7 @@ function createConfigStore({ file, env, writeJson }) {
       if (!existing?.builtin) {
         const command = text(data.command, 32, 'Command').replace(/^\//, '').toLowerCase();
         if (!/^[a-z0-9_]{1,32}$/.test(command)) throw new Error('Command may only use a–z, 0–9 and _ (e.g. trxn_wezbo)');
-        if (RESERVED_COMMANDS.has(command)) throw new Error(`/${command} is a built-in command`);
-        if (config.functions.some((f) => f.command === command && f.id !== existing?.id)) throw new Error(`/${command} is already used`);
+        assertCommandFree(command, { fnId: existing?.id });
         const m = data.monitor || {};
         if (!OPS.includes(m.op || '<')) throw new Error('Invalid condition');
         Object.assign(entry, {
@@ -208,6 +239,29 @@ function createConfigStore({ file, env, writeJson }) {
       }
       save();
       return existing?.id || config.functions.at(-1).id;
+    },
+
+    setFunctionEnabled(id, enabled) {
+      if (typeof enabled !== 'boolean') throw new Error('enabled must be true or false');
+      findFn(id).enabled = enabled;
+      save();
+    },
+
+    commands,
+
+    updateCommand(key, data) {
+      const current = commands().find((c) => c.key === key);
+      if (!current) throw new Error('Unknown command');
+      const command = text(data.command ?? current.command, 32, 'Command').replace(/^\//, '').toLowerCase();
+      if (!/^[a-z0-9_]{1,32}$/.test(command)) throw new Error('Command may only use a–z, 0–9 and _');
+      assertCommandFree(command, { key });
+      const description = text(data.description ?? current.description, 200, 'Description');
+      if (!description) throw new Error('Description is required (it is shown in /help)');
+      const enabled = current.locked ? true : data.enabled ?? current.enabled;
+      if (typeof enabled !== 'boolean') throw new Error('enabled must be true or false');
+      config.commands = { ...(config.commands || {}), [key]: { command, description, enabled } };
+      save();
+      return commands().find((c) => c.key === key);
     },
 
     deleteFunction(id) {
