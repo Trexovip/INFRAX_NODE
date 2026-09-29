@@ -1,426 +1,1453 @@
-/**
- * Admin panel – web UI to manage alert chats, allowed users, blocked accounts, chat clearing,
- * bot token, functions (APIs with master/own keys, commands, monitors), and view logs.
- * Built on Node's http module (no extra dependencies). Login with user ID + password
- * (ADMIN_USER / ADMIN_PASSWORD) creates a session cookie.
- */
-const fs = require('fs');
-const path = require('path');
-const http = require('http');
-const crypto = require('crypto');
-const logger = require('./logger');
-
-const LISTS = new Set(['alertChats', 'allowedUsers']);
-const PANEL_PAGE = path.join(__dirname, 'admin.html');
-const LOGIN_PAGE = path.join(__dirname, 'login.html');
-
-const COOKIE = 'admin_session';
-const SESSION_TTL_MS = 12 * 3600 * 1000;
-const MAX_FAILED_LOGINS = 5;
-const LOCKOUT_MS = 15 * 60 * 1000;
-
-const sessions = new Map();      // token -> { user, expires }
-const failedLogins = new Map();  // ip -> { count, until }
-
-const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
-const safeEqual = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
-
-function json(res, status, body, headers = {}) {
-  res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers });
-  res.end(JSON.stringify(body));
-}
-
-function page(res, file) {
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY' });
-  res.end(fs.readFileSync(file));
-}
-
-function redirect(res, to) {
-  res.writeHead(302, { Location: to });
-  res.end();
-}
-
-// raw bytes (needed to verify webhook HMAC signatures)
-function readRawBody(req, limit = 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on('data', (c) => {
-      size += c.length;
-      if (size > limit) { reject(new Error('Body too large')); req.destroy(); return; }
-      chunks.push(c);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = '';
-    req.on('data', (c) => {
-      data += c;
-      if (data.length > 1024 * 1024) { reject(new Error('Body too large')); req.destroy(); } // 1 MB – room for long keys/tokens
-    });
-    req.on('end', () => {
-      try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new Error('Invalid JSON')); }
-    });
-    req.on('error', reject);
-  });
-}
-
-function parseCookies(req) {
-  const out = {};
-  for (const part of (req.headers.cookie || '').split(';')) {
-    const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bot Admin</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1b1f24; --muted: #667085; --border: #e3e6ea;
+    --accent: #2563eb; --accent-text: #fff; --danger: #c62828; --ok: #1b7f3b; --row: #fafbfc;
+    color-scheme: light;
   }
-  return out;
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418; --card: #1a1e24; --text: #e6e8eb; --muted: #98a2b3; --border: #2b3139;
+      --accent: #4c8dff; --accent-text: #fff; --danger: #ff6b6b; --ok: #4ade80; --row: #161a1f;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+  h2 { font-size: 15px; margin: 0 0 2px; display: flex; gap: 8px; align-items: center; }
+  .count { background: var(--row); border: 1px solid var(--border); border-radius: 99px; padding: 0 8px; font-size: 12px; color: var(--muted); font-weight: 500; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  form { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  input { flex: 1 1 180px; min-width: 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+  input[type="checkbox"] { flex: none; width: auto; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button { padding: 7px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; }
+  button:hover { border-color: var(--muted); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.danger { color: var(--danger); }
+  button.confirm { background: var(--danger); border-color: var(--danger); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 8px; border-top: 1px solid var(--border); vertical-align: middle; }
+  th { font-size: 12px; color: var(--muted); font-weight: 500; border-top: 0; }
+  td.actions { text-align: right; white-space: nowrap; }
+  td.actions button + button { margin-left: 6px; }
+  code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); padding: 14px 8px; border-top: 1px solid var(--border); }
+  #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 8px; max-width: calc(100% - 32px); }
+  #toast.error { background: var(--danger); color: #fff; }
+
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; justify-content: space-between; margin-bottom: 20px; }
+  header .sub { margin: 0; }
+  .who { display: flex; gap: 10px; align-items: center; color: var(--muted); }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+  .tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 14px; color: var(--muted); }
+  .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 500; }
+
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+  .toolbar input { flex: 1 1 220px; }
+  select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+  .toolbar label { display: flex; gap: 6px; align-items: center; color: var(--muted); white-space: nowrap; }
+  .toolbar label input { flex: none; margin: 0; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .chips button { padding: 3px 10px; border-radius: 99px; font-size: 12px; }
+  .chips button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  #logs { font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 65vh; overflow: auto;
+          border: 1px solid var(--border); border-radius: 8px; background: var(--row); }
+  .log { display: grid; grid-template-columns: max-content 52px 1fr; gap: 10px; padding: 5px 10px; border-top: 1px solid var(--border); }
+  .log:first-child { border-top: 0; }
+  .log time { color: var(--muted); white-space: nowrap; }
+  .log .lvl { font-weight: 600; text-transform: uppercase; font-size: 11px; padding-top: 1px; }
+  .log.info .lvl { color: var(--muted); }
+  .log.warn .lvl { color: #b26a00; }
+  .log.error .lvl { color: var(--danger); }
+  .log.error { background: color-mix(in srgb, var(--danger) 7%, transparent); }
+  .log .msg { white-space: pre-wrap; word-break: break-word; }
+  @media (max-width: 560px) { .log { grid-template-columns: 1fr; gap: 0; } }
+
+  .tag { display: inline-block; font-size: 11px; font-weight: 500; padding: 0 7px; border-radius: 99px; border: 1px solid var(--border); color: var(--muted); margin-right: 4px; white-space: nowrap; }
+  .tag.low { color: var(--danger); border-color: currentColor; }
+  .tag.blocked { color: #b26a00; border-color: currentColor; }
+  .tag.ok { color: var(--ok); border-color: currentColor; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.dim td { opacity: .6; }
+  .setting { display: flex; gap: 10px; align-items: flex-start; }
+  .setting input { flex: none; width: 18px; height: 18px; margin: 2px 0 0; }
+  .setting b { display: block; }
+  .row-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 14px; }
+
+  form.stack { display: block; }
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 12px; margin-bottom: 12px; }
+  .fields label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  .fields label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-size: 14px; padding-top: 18px; }
+  .fields input, .fields select { flex: none; width: 100%; }
+  .fields label.check input { width: auto; }
+  input[type="time"], input[type="number"] { flex: none; }
+  .form-title { font-size: 13px; font-weight: 600; margin: 18px 0 10px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .url { display: inline-block; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+  .dot.on { background: var(--ok); }
+  .dot.off { background: var(--danger); }
+  .inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .inline input[type="number"] { width: 80px; }
+  .webhook { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px; background: var(--row); }
+  .webhook h3 { font-size: 14px; margin: 0 0 4px; display: flex; gap: 8px; align-items: center; }
+  .webhook.dim { opacity: .7; }
+  button.toggle { min-width: 84px; font-weight: 500; }
+  button.toggle.on { color: var(--ok); border-color: currentColor; }
+  button.toggle.off { color: var(--muted); }
+  .cmd-input { display: flex; align-items: center; gap: 2px; min-width: 150px; }
+  .cmd-input span { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #cmds input { width: 100%; }
+  #cmds td { vertical-align: top; }
+  #cmds td.what { font-size: 12px; max-width: 220px; }
+  #help-preview { margin: 0; padding: 12px 14px; background: var(--row); border: 1px solid var(--border); border-radius: 8px;
+                  white-space: pre-wrap; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-x: auto; }
+  .warn-box { background: color-mix(in srgb, #b26a00 10%, transparent); border: 1px solid color-mix(in srgb, #b26a00 35%, transparent); border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Monitoring Bot · Admin</h1>
+      <p class="sub">Changes apply immediately – no restart needed.</p>
+    </div>
+    <div class="who">Signed in as <b id="me">…</b> <button type="button" id="logout">Sign out</button></div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button type="button" role="tab" data-tab="access" aria-selected="true">Access</button>
+    <button type="button" role="tab" data-tab="accounts" aria-selected="false">Accounts</button>
+    <button type="button" role="tab" data-tab="chats" aria-selected="false">Chats</button>
+    <button type="button" role="tab" data-tab="commands" aria-selected="false">Commands</button>
+    <button type="button" role="tab" data-tab="functions" aria-selected="false">Functions</button>
+    <button type="button" role="tab" data-tab="settings" aria-selected="false">Settings</button>
+    <button type="button" role="tab" data-tab="logs" aria-selected="false">Logs</button>
+  </nav>
+
+  <div id="tab-access">
+  <section>
+    <h2>Alert chats <span class="count" id="alertChats-count">0</span></h2>
+    <p class="hint">Groups, channels or users that receive alerts. Members of these chats can also use bot commands. Send <code>/id</code> in the group to get its ID (groups start with <code>-</code>).</p>
+    <form data-list="alertChats">
+      <input name="id" placeholder="Chat ID, e.g. -1001234567890" required autocomplete="off">
+      <input name="label" placeholder="Label (optional – auto-filled from Telegram)" autocomplete="off">
+      <button class="primary">Add chat</button>
+    </form>
+    <div class="table-wrap"><table id="alertChats"></table></div>
+  </section>
+
+  <section>
+    <h2>Allowed users <span class="count" id="allowedUsers-count">0</span></h2>
+    <p class="hint">Users who can run bot commands from any chat (e.g. in a private DM with the bot).</p>
+    <form data-list="allowedUsers">
+      <input name="id" placeholder="User ID, e.g. 123456789" required autocomplete="off" inputmode="numeric">
+      <input name="label" placeholder="Label (optional)" autocomplete="off">
+      <button class="primary">Add user</button>
+    </form>
+    <div class="table-wrap"><table id="allowedUsers"></table></div>
+  </section>
+
+  <section>
+    <h2>Access requests <span class="count" id="requests-count">0</span></h2>
+    <p class="hint">People who messaged the bot without access. Approve them with one click.</p>
+    <div class="table-wrap"><table id="requests"></table></div>
+  </section>
+  </div>
+
+  <div id="tab-accounts" hidden>
+  <section>
+    <h2>Balance check settings</h2>
+    <p class="hint" id="acct-last">Last balance check: …</p>
+    <label class="setting">
+      <input type="checkbox" id="skip-inactive">
+      <span><b>Skip inactive accounts</b><span class="muted">Accounts with <code>is_active = false</code> are left out of balance checks and low-balance alerts.</span></span>
+    </label>
+    <div class="row-actions">
+      <button type="button" id="run-check">Run balance check now</button>
+      <span class="muted">Changes apply on the next check (every few minutes), or run one now.</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Blocked accounts <span class="count" id="blocked-count">0</span></h2>
+    <p class="hint">Blocked accounts get no notifications (low balance or transaction failures) and are left out of balance checks.</p>
+    <form id="block-form">
+      <input name="account" placeholder="Account number or account ID" required autocomplete="off">
+      <input name="label" placeholder="Label (optional)" autocomplete="off">
+      <button class="primary">Block account</button>
+    </form>
+    <div class="table-wrap"><table id="blocked"></table></div>
+  </section>
+
+  <section>
+    <h2>All accounts <span class="count" id="accounts-count">0</span></h2>
+    <p class="hint">Every account from the last balance check, including inactive and blocked ones.</p>
+    <div class="toolbar">
+      <input id="acct-q" type="search" placeholder="Search name, bank or account number…" autocomplete="off">
+      <select id="acct-filter" aria-label="Show">
+        <option value="">All accounts</option>
+        <option value="tracked">Tracked</option>
+        <option value="low">Low balance</option>
+        <option value="inactive">Inactive</option>
+        <option value="blocked">Blocked</option>
+      </select>
+    </div>
+    <div class="table-wrap"><table id="accounts"></table></div>
+  </section>
+  </div>
+
+  <div id="tab-chats" hidden>
+  <section>
+    <h2>Auto-clear</h2>
+    <p class="hint">Automatically delete the bot's messages (alerts, replies) and the commands it handled. Telegram only lets bots delete messages less than 48 hours old.</p>
+    <form id="autoclear-form" class="stack">
+      <label class="setting" style="margin-bottom:14px">
+        <input type="checkbox" name="enabled">
+        <span><b>Auto-clear chats</b><span class="muted" id="ac-last"></span></span>
+      </label>
+      <div class="fields">
+        <label>When
+          <select name="mode">
+            <option value="rolling">Continuously (checks every 10 minutes)</option>
+            <option value="daily">Once a day at a set time</option>
+          </select>
+        </label>
+        <label id="ac-time-wrap">Time (<span id="ac-tz"></span>)
+          <input type="time" name="time" required>
+        </label>
+        <label>Delete messages older than (hours)
+          <input type="number" name="olderThanHours" min="0" max="47" step="1" required>
+        </label>
+      </div>
+      <p class="hint" id="ac-summary"></p>
+      <button class="primary">Save auto-clear</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>Chats <span class="count" id="chats-count">0</span></h2>
+    <p class="hint">Clear now deletes every bot message in the chat that Telegram still allows (under 48 hours). In groups the bot must be an admin with “Delete messages” permission to delete other people's commands.</p>
+    <div class="row-actions" style="margin:0 0 12px" id="clear-all-wrap"></div>
+    <div class="table-wrap"><table id="chats"></table></div>
+  </section>
+  </div>
+
+  <div id="tab-settings" hidden>
+  <section>
+    <h2>Telegram bot</h2>
+    <p class="hint" id="bot-status">…</p>
+    <form id="token-form">
+      <input name="token" type="password" placeholder="New bot token from @BotFather (123456:ABC…)" autocomplete="off" required>
+      <button class="primary">Save token</button>
+    </form>
+    <p class="hint" style="margin:0">The token is checked with Telegram before it replaces the current one. The bot reconnects immediately.</p>
+  </section>
+  </div>
+
+  <div id="tab-commands" hidden>
+  <section>
+    <h2>Bot commands</h2>
+    <p class="hint">Rename any command, change the text shown in /help, and switch commands on or off. Inactive commands are ignored by the bot and hidden from /help and the Telegram menu. Changes apply immediately.</p>
+    <div class="table-wrap"><table id="cmds"></table></div>
+  </section>
+
+  <section>
+    <h2>Function commands <span class="count" id="fncmds-count">0</span></h2>
+    <p class="hint">Commands you created in the Functions tab. Switching one off also pauses its alerts.</p>
+    <div class="table-wrap"><table id="fncmds"></table></div>
+  </section>
+
+  <section>
+    <h2>/help preview</h2>
+    <p class="hint">This is exactly what the bot replies to /help (and /start).</p>
+    <pre id="help-preview"></pre>
+  </section>
+  </div>
+
+  <div id="tab-functions" hidden>
+  <div class="row-actions" style="margin:0 0 16px">
+    <button type="button" class="primary" id="new-fn">+ New function</button>
+    <span class="muted">A function is a Telegram command (e.g. <code>/trxn_wezbo</code>) backed by one or more APIs, with optional alerts.</span>
+  </div>
+
+  <section id="fn-editor" hidden>
+    <form id="fn-form" class="stack">
+      <h2 id="fn-form-title">New function</h2>
+      <input type="hidden" name="id">
+      <div class="fields">
+        <label>Name<input name="name" placeholder="e.g. Wezbo transaction count" required autocomplete="off"></label>
+        <label data-custom>Telegram command<input name="command" placeholder="trxn_wezbo" autocomplete="off" pattern="/?[A-Za-z0-9_]{1,32}"></label>
+        <label style="grid-column: 1 / -1">Description (shown in /help and the command menu)<input name="description" autocomplete="off"></label>
+        <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+      </div>
+
+      <div class="form-title">Master key <span class="muted" style="font-weight:400">– used by every API in this function that is set to “Master key”</span></div>
+      <div class="fields">
+        <label>Key<input name="mkey" type="password" autocomplete="off"></label>
+        <label>Secret<input name="msecret" type="password" autocomplete="off"></label>
+        <label>Key header<input name="mkeyHeader" value="x-trexo-key" autocomplete="off"></label>
+        <label>Secret header<input name="msecretHeader" value="x-trexo-secret" autocomplete="off"></label>
+      </div>
+
+      <div data-custom>
+        <div class="form-title">Alerts</div>
+        <label class="setting" style="margin-bottom:12px">
+          <input type="checkbox" name="monEnabled">
+          <span><b>Notify alert chats when the value crosses a threshold</b><span class="muted">Checks each API on a schedule. Sends one alert, optional reminders, and a message when it's back to normal.</span></span>
+        </label>
+        <div class="fields">
+          <label>Check every (minutes)<input name="everyMin" type="number" min="1" max="1440" step="1" value="5"></label>
+          <label>Alert when value is
+            <select name="op">
+              <option value="<">below (&lt;)</option>
+              <option value="<=">at or below (≤)</option>
+              <option value=">">above (&gt;)</option>
+              <option value=">=">at or above (≥)</option>
+              <option value="==">equal to (=)</option>
+              <option value="!=">not equal to (≠)</option>
+            </select>
+          </label>
+          <label>Threshold<input name="threshold" type="number" step="any" value="100"></label>
+          <label>Remind every (minutes, 0 = never)<input name="remindMin" type="number" min="0" max="10080" step="1" value="60"></label>
+          <label>Show value as
+            <select name="format">
+              <option value="number">Number (1,234)</option>
+              <option value="inr">Rupees (₹1,234.00)</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="inline">
+        <button class="primary">Save function</button>
+        <button type="button" data-cancel>Cancel</button>
+      </div>
+    </form>
+  </section>
+
+  <section id="api-editor" hidden>
+    <form id="api-form" class="stack">
+      <h2 id="api-form-title">Add API</h2>
+      <input type="hidden" name="fnId">
+      <input type="hidden" name="id">
+      <div class="fields">
+        <label>Name<input name="name" placeholder="e.g. Wezbo" required autocomplete="off"></label>
+        <label data-custom>Method
+          <select name="method"><option>GET</option><option>POST</option></select>
+        </label>
+        <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+        <label style="grid-column: 1 / -1">URL<input name="url" type="url" placeholder="https://api.example.com/api/v1/transactions/count" required autocomplete="off"></label>
+        <label data-custom style="grid-column: 1 / -1">Query parameters (optional)
+          <input name="query" placeholder="merchant=wezbo&status=SUCCESS&from={today}" autocomplete="off">
+        </label>
+        <label data-custom>Pass command text as parameter (optional)<input name="argParam" placeholder="e.g. merchant" autocomplete="off"></label>
+        <label data-txn>“Since” query parameter<input name="sinceParam" placeholder="from" autocomplete="off"></label>
+      </div>
+      <p class="hint" data-custom>Placeholders: <code>{today}</code> <code>{now}</code> <code>{1h_ago}</code> <code>{24h_ago}</code>. With a parameter name set, <code>/command wezbo</code> sends <code>?merchant=wezbo</code>.</p>
+
+      <div class="form-title">API key</div>
+      <div class="fields">
+        <label>Use
+          <select name="keyMode">
+            <option value="master">Function's master key</option>
+            <option value="own">Separate key for this API</option>
+            <option value="none">No key</option>
+          </select>
+        </label>
+      </div>
+      <div class="fields" data-own>
+        <label>Key<input name="key" type="password" autocomplete="off"></label>
+        <label>Secret<input name="secret" type="password" autocomplete="off"></label>
+        <label>Key header<input name="keyHeader" value="x-trexo-key" autocomplete="off"></label>
+        <label>Secret header<input name="secretHeader" value="x-trexo-secret" autocomplete="off"></label>
+      </div>
+
+      <div data-custom>
+        <div class="form-title">Value to read from the response</div>
+        <div class="fields">
+          <label>Value is
+            <select name="valueMode">
+              <option value="path">A number field</option>
+              <option value="count">Number of items in a list</option>
+              <option value="sum">Sum of a field across a list</option>
+            </select>
+          </label>
+          <label><span data-path-label>Field path</span><input name="valuePath" placeholder="data.count" autocomplete="off"></label>
+          <label data-sum>Field to add up<input name="sumField" placeholder="amount" autocomplete="off"></label>
+        </div>
+        <p class="hint">Use dots for nested fields, e.g. <code>data.total_count</code> or <code>result.0.count</code>. Use <b>Test</b> after saving to see the value.</p>
+      </div>
+
+      <div class="inline">
+        <button class="primary">Save API</button>
+        <button type="button" data-cancel>Cancel</button>
+      </div>
+    </form>
+  </section>
+
+  <div class="warn-box" id="wh-local" hidden>This panel is open on <b>localhost</b> – payment providers can't reach it. Webhooks work once the bot runs on a public HTTPS address (e.g. your Railway domain).</div>
+
+  <section id="wh-editor" hidden>
+    <form id="wh-form" class="stack">
+      <h2 id="wh-form-title">New webhook</h2>
+      <input type="hidden" name="id">
+      <input type="hidden" name="fnId">
+      <div class="fields">
+        <label>Name<input name="name" placeholder="e.g. Trexo payouts" required autocomplete="off"></label>
+        <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+      </div>
+
+      <div class="form-title">“In a row” alerts <span class="muted" style="font-weight:400">– one alert per customer listing every transaction with its ID and reason</span></div>
+      <div class="fields">
+        <label>🚨 Alert after this many failed in a row (0 = off)<input name="streakFailed" type="number" min="0" max="50" step="1" value="5"></label>
+        <label>⏳ Alert after this many pending in a row (0 = off)<input name="streakPending" type="number" min="0" max="50" step="1" value="5"></label>
+      </div>
+      <p class="hint">The alert shows the customer name, organisation, and each transaction's ID, amount, time and reason. It repeats at 2×, 3× … and a “stopped / cleared” message follows when the customer's latest transaction is no longer failed / pending.</p>
+
+      <div class="form-title">Every single transaction <span class="muted" style="font-weight:400">– optional, one message per transaction</span></div>
+      <div class="inline" style="gap:18px; margin-bottom:12px">
+        <label class="inline"><input type="checkbox" name="nFailed"> ❌ Failed</label>
+        <label class="inline"><input type="checkbox" name="nPending"> ⏳ Pending</label>
+        <label class="inline"><input type="checkbox" name="nSuccess"> ✅ Success</label>
+      </div>
+      <div class="fields">
+        <label>Send to chat IDs (blank = all alert chats)<input name="chatIds" placeholder="-1001234567890, -1009876543210" autocomplete="off"></label>
+        <label class="check"><input type="checkbox" name="feedStreaks"> Also count in /failures (Transaction failures streaks)</label>
+      </div>
+
+      <div class="form-title">Security <span class="muted" style="font-weight:400">– optional check that a delivery really comes from your vendor</span></div>
+      <div class="fields">
+        <label>Method
+          <select name="auth">
+            <option value="none">No secret – vendor just posts to the URL</option>
+            <option value="url">Secret in the URL</option>
+            <option value="header">Secret in a header</option>
+            <option value="hmac">HMAC-SHA256 signature header</option>
+          </select>
+        </label>
+        <label data-hdr>Header name<input name="headerName" autocomplete="off"></label>
+        <label data-hdr>Secret to use
+          <select name="secretSource">
+            <option value="own">Separate webhook secret</option>
+            <option value="master_secret">Function's master secret</option>
+            <option value="master_key">Function's master key</option>
+          </select>
+        </label>
+        <label data-own-secret>Secret<input name="secret" autocomplete="off" placeholder="leave blank to generate one"></label>
+      </div>
+      <p class="hint" id="wh-auth-hint"></p>
+
+      <details style="margin-bottom:12px">
+        <summary class="muted" style="cursor:pointer">Status words (advanced)</summary>
+        <div class="fields" style="margin-top:10px">
+          <label>Failed<input name="sFailed" autocomplete="off"></label>
+          <label>Pending<input name="sPending" autocomplete="off"></label>
+          <label>Success<input name="sSuccess" autocomplete="off"></label>
+        </div>
+        <p class="hint">Comma-separated, case-insensitive. The status is read from <code>status</code> / <code>txn_status</code>, or from the event name (e.g. <code>payment.failed</code>).</p>
+      </details>
+
+      <div class="inline">
+        <button class="primary">Save webhook</button>
+        <button type="button" data-cancel>Cancel</button>
+      </div>
+    </form>
+  </section>
+
+  <div id="fn-list"></div>
+  </div>
+
+  <div id="tab-logs" hidden>
+  <section>
+    <div class="toolbar">
+      <input id="log-q" type="search" placeholder="Search logs…" autocomplete="off">
+      <select id="log-level" aria-label="Level">
+        <option value="">All levels</option>
+        <option value="info">Info</option>
+        <option value="warn">Warnings</option>
+        <option value="error">Errors</option>
+      </select>
+      <label><input type="checkbox" id="log-live" checked> Live</label>
+    </div>
+    <div class="chips" id="log-chips">
+      <button type="button" data-q="" aria-pressed="true">Everything</button>
+      <button type="button" data-q="[ALERT]" aria-pressed="false">Alerts sent</button>
+      <button type="button" data-q="[CMD]" aria-pressed="false">Bot commands</button>
+      <button type="button" data-q="[DENIED]" aria-pressed="false">Denied access</button>
+      <button type="button" data-q="[ADMIN]" aria-pressed="false">Admin actions</button>
+      <button type="button" data-q="[CLEAR]" aria-pressed="false">Chat clears</button>
+      <button type="button" data-q="[WEBHOOK]" aria-pressed="false">Webhooks</button>
+    </div>
+    <div id="logs"></div>
+    <p class="hint" id="log-info" style="margin:10px 0 0"></p>
+  </section>
+  </div>
+</main>
+<div id="toast" hidden></div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+const el = (tag, props = {}, ...children) => {
+  const n = Object.assign(document.createElement(tag), props);
+  n.append(...children);
+  return n;
+};
+const fmt = (ts) => ts ? new Date(ts).toLocaleString() : '';
+
+let toastTimer;
+function toast(msg, isError) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = isError ? 'error' : '';
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (t.hidden = true), 3500);
 }
 
-function getSession(req) {
-  const token = parseCookies(req)[COOKIE];
-  const s = token && sessions.get(token);
-  if (!s) return null;
-  if (s.expires < Date.now()) { sessions.delete(token); return null; }
-  return { token, ...s };
+async function api(method, url, body) {
+  const res = await fetch(url, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401) { location.href = '/login'; throw new Error('Session expired'); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
 }
 
-// Best-effort: look up a chat/user title from Telegram so entries get a readable label
-async function lookupLabel(bot, id) {
-  if (!bot) return '';
+async function run(btn, fn, okMsg) {
+  btn.disabled = true;
+  try { await fn(); if (okMsg) toast(okMsg); await load(); }
+  catch (e) { toast(e.message, true); }
+  finally { btn.disabled = false; }
+}
+
+// Two-step destructive button: first click arms, second click confirms
+function confirmButton(label, onConfirm, okMsg, after) {
+  const b = el('button', { className: 'danger', textContent: label, type: 'button' });
+  let armed = false, timer;
+  const reset = () => { armed = false; b.textContent = label; b.className = 'danger'; };
+  b.onclick = () => {
+    if (!armed) {
+      armed = true; b.textContent = 'Confirm?'; b.className = 'confirm';
+      timer = setTimeout(reset, 3000);
+      return;
+    }
+    clearTimeout(timer);
+    reset();
+    run(b, onConfirm, okMsg).then(after);
+  };
+  return b;
+}
+const removeButton = (onConfirm) => confirmButton('Remove', onConfirm, 'Removed');
+
+function renderList(name, entries, extraButton) {
+  const table = $('#' + name);
+  $('#' + name + '-count').textContent = entries.length;
+  table.replaceChildren();
+  if (!entries.length) {
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 4, textContent: 'None yet.' })));
+    return;
+  }
+  table.append(el('tr', {},
+    el('th', { textContent: 'ID' }), el('th', { textContent: 'Label' }),
+    el('th', { textContent: 'Added' }), el('th')));
+  for (const e of entries) {
+    const actions = el('td', { className: 'actions' });
+    if (extraButton) actions.append(extraButton(e));
+    actions.append(removeButton(() => api('DELETE', `/api/lists/${name}/${encodeURIComponent(e.id)}`)));
+    table.append(el('tr', {},
+      el('td', {}, el('code', { textContent: e.id })),
+      el('td', { textContent: e.label || '—', className: e.label ? '' : 'muted' }),
+      el('td', { textContent: fmt(e.addedAt), className: 'muted' }),
+      actions));
+  }
+}
+
+function renderRequests(requests, access) {
+  const rows = Object.values(requests).sort((a, b) => b.at - a.at);
+  const table = $('#requests');
+  $('#requests-count').textContent = rows.length;
+  table.replaceChildren();
+  if (!rows.length) {
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 4, textContent: 'No pending requests.' })));
+    return;
+  }
+  const chatIds = new Set(access.alertChats.map((c) => c.id));
+  table.append(el('tr', {},
+    el('th', { textContent: 'User' }), el('th', { textContent: 'From chat' }),
+    el('th', { textContent: 'When' }), el('th')));
+  for (const r of rows) {
+    const who = [r.name, r.username && '@' + r.username].filter(Boolean).join(' · ');
+    const chat = r.chatType === 'private' ? 'Private DM' : `${r.chatTitle || r.chatType} (${r.chatId})`;
+    const actions = el('td', { className: 'actions' });
+
+    const allow = el('button', { className: 'primary', textContent: 'Allow user', type: 'button' });
+    allow.onclick = () => run(allow, () => api('POST', '/api/lists/allowedUsers', { id: r.userId, label: who }), 'User allowed');
+    actions.append(allow);
+
+    if (r.chatType !== 'private' && !chatIds.has(r.chatId)) {
+      const addChat = el('button', { textContent: 'Add chat', type: 'button' });
+      addChat.onclick = () => run(addChat, () => api('POST', '/api/lists/alertChats', { id: r.chatId, label: r.chatTitle }), 'Chat added');
+      actions.append(addChat);
+    }
+
+    const dismiss = el('button', { textContent: 'Dismiss', type: 'button' });
+    dismiss.onclick = () => run(dismiss, () => api('DELETE', `/api/requests/${encodeURIComponent(r.userId)}`));
+    actions.append(dismiss);
+
+    table.append(el('tr', {},
+      el('td', {}, el('div', { textContent: who || '—' }), el('code', { className: 'muted', textContent: r.userId })),
+      el('td', { textContent: chat }),
+      el('td', { textContent: fmt(r.at), className: 'muted' }),
+      actions));
+  }
+}
+
+async function load() {
   try {
-    const c = await Promise.race([bot.getChat(id), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))]);
-    return c.title || [c.first_name, c.last_name].filter(Boolean).join(' ') || (c.username ? '@' + c.username : '');
-  } catch {
-    return '';
+    const a = await api('GET', '/api/access');
+    renderList('alertChats', a.alertChats, (e) => {
+      const b = el('button', { textContent: 'Test', type: 'button' });
+      b.onclick = () => run(b, () => api('POST', `/api/test/${encodeURIComponent(e.id)}`), 'Test message sent');
+      return b;
+    });
+    renderList('allowedUsers', a.allowedUsers);
+    renderRequests(a.requests || {}, a);
+  } catch (e) {
+    toast('Failed to load: ' + e.message, true);
   }
 }
 
-function startAdmin({ port, host, user, password, trustProxy, getBot, access, runBalanceCheck, sendTest, chats, settings, commands, functions, webhooks }) {
-  if (!password) {
-    console.warn('ADMIN_PASSWORD not set – admin panel disabled');
-    return null;
-  }
-
-  const clientIp = (req) =>
-    (trustProxy && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress;
-  const isHttps = (req) => req.socket.encrypted || (trustProxy && req.headers['x-forwarded-proto'] === 'https');
-
-  const sessionCookie = (req, token, maxAgeSec) =>
-    `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAgeSec}${isHttps(req) ? '; Secure' : ''}`;
-
-  async function login(req, res) {
-    const ip = clientIp(req);
-    const f = failedLogins.get(ip);
-    if (f?.until > Date.now()) {
-      const mins = Math.ceil((f.until - Date.now()) / 60000);
-      return json(res, 429, { error: `Too many failed attempts. Try again in ${mins} min.` });
-    }
-
-    const body = await readBody(req);
-    const okUser = safeEqual(String(body.username || ''), user);
-    const okPass = safeEqual(String(body.password || ''), password);
-    if (!(okUser && okPass)) {
-      const count = (f?.count || 0) + 1;
-      failedLogins.set(ip, count >= MAX_FAILED_LOGINS ? { count: 0, until: Date.now() + LOCKOUT_MS } : { count, until: 0 });
-      console.warn(`[ADMIN] failed login for "${String(body.username || '').slice(0, 50)}" from ${ip}`);
-      return json(res, 401, { error: 'Invalid user ID or password' });
-    }
-
-    failedLogins.delete(ip);
-    const token = crypto.randomBytes(32).toString('hex');
-    sessions.set(token, { user, expires: Date.now() + SESSION_TTL_MS });
-    console.log(`[ADMIN] ${user} logged in from ${ip}`);
-    return json(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, token, SESSION_TTL_MS / 1000) });
-  }
-
-  const server = http.createServer(async (req, res) => {
-    try {
-      const url = new URL(req.url, 'http://local');
-      const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-      const session = getSession(req);
-
-      // --- transaction webhooks (public – authenticated by the webhook's own secret/signature) ---
-      // POST /webhook/:id   or   POST /webhook/:id/:secret
-      if (parts[0] === 'webhook' && (parts.length === 2 || parts.length === 3)) {
-        if (req.method !== 'POST') return json(res, 405, { error: 'Use POST' });
-        const rawBody = await readRawBody(req);
-        const r = webhooks.receive({
-          id: parts[1], pathSecret: parts[2], headers: req.headers, rawBody,
-          contentType: req.headers['content-type'],
-        });
-        return json(res, r.status, r.body);
-      }
-
-      // Writes require a JSON content type – blocks simple cross-site form posts
-      if (req.method !== 'GET' && !String(req.headers['content-type'] || '').startsWith('application/json')) {
-        return json(res, 415, { error: 'Content-Type must be application/json' });
-      }
-
-      // --- public routes ---
-      if (req.method === 'GET' && url.pathname === '/login') return session ? redirect(res, '/') : page(res, LOGIN_PAGE);
-      if (req.method === 'POST' && url.pathname === '/api/login') return await login(req, res);
-
-      // --- everything below needs a session ---
-      if (!session) {
-        if (parts[0] === 'api') return json(res, 401, { error: 'Not logged in' });
-        return redirect(res, '/login');
-      }
-
-      if (req.method === 'GET' && url.pathname === '/') return page(res, PANEL_PAGE);
-      if (parts[0] !== 'api') return json(res, 404, { error: 'Not found' });
-
-      // POST /api/logout
-      if (req.method === 'POST' && parts[1] === 'logout') {
-        sessions.delete(session.token);
-        console.log(`[ADMIN] ${session.user} logged out`);
-        return json(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, '', 0) });
-      }
-
-      // GET /api/me
-      if (req.method === 'GET' && parts[1] === 'me') return json(res, 200, { user: session.user });
-
-      // GET /api/access
-      if (req.method === 'GET' && parts[1] === 'access' && parts.length === 2) {
-        return json(res, 200, access.snapshot());
-      }
-
-      // GET /api/logs?after=&level=&q=&limit=
-      if (req.method === 'GET' && parts[1] === 'logs') {
-        const p = url.searchParams;
-        return json(res, 200, logger.query({
-          after: Number(p.get('after')) || 0,
-          level: p.get('level') || '',
-          q: p.get('q') || '',
-          limit: Math.min(Number(p.get('limit')) || 500, 2000),
-        }));
-      }
-
-      // POST /api/lists/:list  { id, label }
-      if (req.method === 'POST' && parts[1] === 'lists' && LISTS.has(parts[2]) && parts.length === 3) {
-        const body = await readBody(req);
-        const id = String(body.id || '').trim();
-        const label = String(body.label || '').trim() || (await lookupLabel(getBot(), id));
-        const entry = access.add(parts[2], id, label);
-        console.log(`[ADMIN] ${session.user} added ${id}${entry.label ? ` (${entry.label})` : ''} to ${parts[2]}`);
-        return json(res, 201, entry);
-      }
-
-      // DELETE /api/lists/:list/:id
-      if (req.method === 'DELETE' && parts[1] === 'lists' && LISTS.has(parts[2]) && parts.length === 4) {
-        access.remove(parts[2], parts[3]);
-        console.log(`[ADMIN] ${session.user} removed ${parts[3]} from ${parts[2]}`);
-        return json(res, 200, { ok: true });
-      }
-
-      // POST /api/test/:chatId  – send a test message to a chat
-      if (req.method === 'POST' && parts[1] === 'test' && parts.length === 3) {
-        await sendTest(parts[2]);
-        console.log(`[ADMIN] ${session.user} sent test message to ${parts[2]}`);
-        return json(res, 200, { ok: true });
-      }
-
-      // GET /api/accounts  – all accounts from the last balance check + blocked list + settings
-      if (req.method === 'GET' && parts[1] === 'accounts' && parts.length === 2) {
-        const snap = access.snapshot();
-        return json(res, 200, { ...access.accounts(), blocked: snap.blockedAccounts, settings: snap.settings });
-      }
-
-      // POST /api/blocked  { id, accountId, accountNumber, label, bankName }
-      if (req.method === 'POST' && parts[1] === 'blocked' && parts.length === 2) {
-        const entry = access.blockAccount(await readBody(req));
-        console.log(`[ADMIN] ${session.user} blocked account ${entry.id}${entry.label ? ` (${entry.label})` : ''}`);
-        return json(res, 201, entry);
-      }
-
-      // DELETE /api/blocked/:id
-      if (req.method === 'DELETE' && parts[1] === 'blocked' && parts.length === 3) {
-        access.unblockAccount(parts[2]);
-        console.log(`[ADMIN] ${session.user} unblocked account ${parts[2]}`);
-        return json(res, 200, { ok: true });
-      }
-
-      // POST /api/settings  { skipInactive }
-      if (req.method === 'POST' && parts[1] === 'settings' && parts.length === 2) {
-        const settings = access.setSettings(await readBody(req));
-        console.log(`[ADMIN] ${session.user} set skipInactive=${settings.skipInactive}`);
-        return json(res, 200, settings);
-      }
-
-      // POST /api/check-balances  – run the balance check now
-      if (req.method === 'POST' && parts[1] === 'check-balances' && parts.length === 2) {
-        console.log(`[ADMIN] ${session.user} triggered a balance check`);
-        await runBalanceCheck();
-        return json(res, 200, { ok: true });
-      }
-
-      // --- chats ---
-      // GET /api/chats
-      if (req.method === 'GET' && parts[1] === 'chats' && parts.length === 2) return json(res, 200, chats.view());
-
-      // POST /api/chats/clear  { chatId? }  – no chatId = all chats
-      if (req.method === 'POST' && parts[1] === 'chats' && parts[2] === 'clear' && parts.length === 3) {
-        const { chatId } = await readBody(req);
-        console.log(`[ADMIN] ${session.user} cleared ${chatId ? `chat ${chatId}` : 'all chats'}`);
-        return json(res, 200, await chats.clear(chatId ? String(chatId) : undefined));
-      }
-
-      // POST /api/chats/auto-clear  { enabled, mode, time, olderThanHours }
-      if (req.method === 'POST' && parts[1] === 'chats' && parts[2] === 'auto-clear' && parts.length === 3) {
-        const ac = chats.setAutoClear(await readBody(req));
-        console.log(`[ADMIN] ${session.user} set auto-clear: ${ac.enabled ? `${ac.mode === 'daily' ? `daily at ${ac.time}` : 'continuous'}, older than ${ac.olderThanHours}h` : 'off'}`);
-        return json(res, 200, ac);
-      }
-
-      // --- settings (bot token) ---
-      if (parts[1] === 'settings') {
-        // GET /api/settings
-        if (req.method === 'GET' && parts.length === 2) return json(res, 200, settings.view());
-
-        // POST /api/settings/bot-token  { token }
-        if (req.method === 'POST' && parts[2] === 'bot-token' && parts.length === 3) {
-          const { token } = await readBody(req);
-          const info = await settings.setBotToken(token);
-          console.log(`[ADMIN] ${session.user} changed the Telegram bot token (now @${info?.username})`);
-          return json(res, 200, { ok: true, bot: info });
-        }
-      }
-
-      // --- webhooks admin ---
-      if (parts[1] === 'webhooks') {
-        const [, , whId, action] = parts;
-        // GET /api/webhooks
-        if (req.method === 'GET' && parts.length === 2) return json(res, 200, webhooks.view());
-
-        // POST /api/webhooks  { id?, name, auth, headerName, secret, notify, statuses, chatIds, feedStreaks, enabled }
-        if (req.method === 'POST' && parts.length === 2) {
-          const body = await readBody(req);
-          const id = webhooks.upsert(body);
-          console.log(`[ADMIN] ${session.user} ${body.id ? 'updated' : 'created'} webhook "${String(body.name || '').slice(0, 60)}"`);
-          return json(res, 200, { ok: true, id });
-        }
-
-        // DELETE /api/webhooks/:id
-        if (req.method === 'DELETE' && parts.length === 3) {
-          webhooks.remove(whId);
-          console.log(`[ADMIN] ${session.user} deleted webhook ${whId}`);
-          return json(res, 200, { ok: true });
-        }
-
-        // POST /api/webhooks/:id/secret  – new random secret
-        if (req.method === 'POST' && action === 'secret' && parts.length === 4) {
-          webhooks.regenerateSecret(whId);
-          console.log(`[ADMIN] ${session.user} regenerated the secret of webhook ${whId}`);
-          return json(res, 200, { ok: true });
-        }
-
-        // POST /api/webhooks/:id/test  { kind: failed|pending|success }
-        if (req.method === 'POST' && action === 'test' && parts.length === 4) {
-          const { kind } = await readBody(req);
-          await webhooks.test(whId, kind);
-          console.log(`[ADMIN] ${session.user} sent a test ${kind} notification for webhook ${whId}`);
-          return json(res, 200, { ok: true });
-        }
-      }
-
-      // --- commands (built-in names/descriptions/on-off + function on-off) ---
-      // GET /api/commands
-      if (req.method === 'GET' && parts[1] === 'commands' && parts.length === 2) return json(res, 200, commands.view());
-
-      // POST /api/commands/:key  { command, description, enabled }
-      if (req.method === 'POST' && parts[1] === 'commands' && parts.length === 3) {
-        const c = commands.update(parts[2], await readBody(req));
-        console.log(`[ADMIN] ${session.user} updated command /${c.command} (${c.key}): ${c.enabled ? 'active' : 'inactive'}`);
-        return json(res, 200, c);
-      }
-
-      // POST /api/functions/:id/enabled  { enabled }
-      if (req.method === 'POST' && parts[1] === 'functions' && parts[3] === 'enabled' && parts.length === 4) {
-        const { enabled } = await readBody(req);
-        commands.setFunctionEnabled(parts[2], enabled);
-        console.log(`[ADMIN] ${session.user} ${enabled ? 'activated' : 'deactivated'} function ${parts[2]}`);
-        return json(res, 200, { ok: true });
-      }
-
-      // --- functions (each with a master key and APIs) ---
-      if (parts[1] === 'functions') {
-        const [, , fnId, sub, apiId, action] = parts;
-
-        // GET /api/functions
-        if (req.method === 'GET' && parts.length === 2) return json(res, 200, functions.view());
-
-        // POST /api/functions  { id?, name, command, description, enabled, master, monitor, format }
-        if (req.method === 'POST' && parts.length === 2) {
-          const body = await readBody(req);
-          const id = functions.upsert(body);
-          console.log(`[ADMIN] ${session.user} ${body.id ? 'updated' : 'created'} function "${String(body.name || '').slice(0, 60)}"`);
-          return json(res, 200, { ok: true, id });
-        }
-
-        // DELETE /api/functions/:id
-        if (req.method === 'DELETE' && parts.length === 3) {
-          functions.remove(fnId);
-          console.log(`[ADMIN] ${session.user} deleted function ${fnId}`);
-          return json(res, 200, { ok: true });
-        }
-
-        // POST /api/functions/:id/run  – run the monitor now
-        if (req.method === 'POST' && sub === 'run' && parts.length === 4) {
-          console.log(`[ADMIN] ${session.user} ran function ${fnId}`);
-          await functions.runNow(fnId);
-          return json(res, 200, { ok: true });
-        }
-
-        // POST /api/functions/:id/apis  { id?, name, url, keyMode, key, secret, ... }
-        if (req.method === 'POST' && sub === 'apis' && parts.length === 4) {
-          const body = await readBody(req);
-          const id = functions.upsertApi(fnId, body);
-          console.log(`[ADMIN] ${session.user} ${body.id ? 'updated' : 'added'} API "${String(body.name || '').slice(0, 60)}" in function ${fnId}`);
-          return json(res, 200, { ok: true, id });
-        }
-
-        // DELETE /api/functions/:id/apis/:apiId
-        if (req.method === 'DELETE' && sub === 'apis' && parts.length === 5) {
-          functions.removeApi(fnId, apiId);
-          console.log(`[ADMIN] ${session.user} deleted API ${apiId} from function ${fnId}`);
-          return json(res, 200, { ok: true });
-        }
-
-        // POST /api/functions/:id/apis/:apiId/test
-        if (req.method === 'POST' && sub === 'apis' && action === 'test' && parts.length === 6) {
-          try {
-            return json(res, 200, { ok: true, ...(await functions.testApi(fnId, apiId)) });
-          } catch (e) {
-            const status = e.response?.status;
-            return json(res, 200, { ok: false, error: status ? `HTTP ${status}: ${e.message}` : e.message });
-          }
-        }
-      }
-
-      // DELETE /api/requests/:userId
-      if (req.method === 'DELETE' && parts[1] === 'requests' && parts.length === 3) {
-        access.dismissRequest(parts[2]);
-        console.log(`[ADMIN] ${session.user} dismissed access request from ${parts[2]}`);
-        return json(res, 200, { ok: true });
-      }
-
-      return json(res, 404, { error: 'Not found' });
-    } catch (e) {
-      return json(res, 400, { error: e.response?.body?.description || e.message });
-    }
+document.querySelectorAll('form[data-list]').forEach((form) => {
+  form.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    const btn = form.querySelector('button');
+    const f = form.elements;
+    const body = { id: f.namedItem('id').value.trim(), label: f.namedItem('label').value.trim() };
+    run(btn, async () => { await api('POST', `/api/lists/${form.dataset.list}`, body); form.reset(); }, 'Added');
   });
+});
 
-  // drop expired sessions / lockouts
-  setInterval(() => {
-    const now = Date.now();
-    for (const [t, s] of sessions) if (s.expires < now) sessions.delete(t);
-    for (const [ip, f] of failedLogins) if (f.until < now) failedLogins.delete(ip);
-  }, 10 * 60 * 1000).unref();
+// --- session ---
+api('GET', '/api/me').then((m) => ($('#me').textContent = m.user)).catch(() => {});
+$('#logout').onclick = async () => {
+  try { await api('POST', '/api/logout'); } catch {}
+  location.href = '/login';
+};
 
-  server.on('error', (e) => console.error('Admin panel error:', e.message));
-  server.listen(port, host, () => console.log(`🔐 Admin panel on http://${host}:${port}`));
-  return server;
+// --- tabs ---
+function showTab(name) {
+  document.querySelectorAll('[data-tab]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === name)));
+  for (const t of TABS) $('#tab-' + t).hidden = name !== t;
+  history.replaceState(null, '', name === 'access' ? location.pathname : '#' + name);
+  if (name === 'logs') loadLogs(true);
+  if (name === 'accounts') loadAccounts();
+  if (name === 'chats') loadChats();
+  if (name === 'settings') loadSettings();
+  if (name === 'functions') loadFunctions();
+  if (name === 'commands') loadCommands();
+}
+const TABS = ['access', 'accounts', 'chats', 'commands', 'functions', 'settings', 'logs'];
+
+// --- webhooks (shown inside their function's card in the Functions tab) ---
+let whData = { webhooks: [], deliveries: {}, defaults: {} };
+const AUTH_TEXT = { none: 'no secret', url: 'secret in the URL', header: 'secret header', hmac: 'HMAC-SHA256 signature' };
+const SECRET_TEXT = { master_secret: "function's master secret", master_key: "function's master key" };
+
+async function loadWebhooks() {
+  $('#wh-local').hidden = !/^(localhost|127\.|\[::1\])/.test(location.hostname);
+  whData = await api('GET', '/api/webhooks');
 }
 
-module.exports = { startAdmin };
+const webhookUrl = (w) => `${location.origin}/webhook/${w.id}${w.auth === 'url' ? '/' + w.secret : ''}`;
+
+function copyButton(label, getText) {
+  const b = el('button', { type: 'button', textContent: label });
+  b.onclick = async () => {
+    try { await navigator.clipboard.writeText(getText()); toast('Copied'); }
+    catch { toast('Copy failed – select the text and copy it manually', true); }
+  };
+  return b;
+}
+
+// the "Webhooks" block inside a function card
+function webhooksBlock(fn) {
+  const block = el('div');
+  const hooks = whData.webhooks.filter((w) => w.fnId === fn.id);
+  const add = el('button', { type: 'button', className: 'primary', textContent: '+ Add webhook' });
+  add.onclick = () => openWhEditor(null, fn);
+  block.append(
+    el('div', { className: 'form-title', textContent: `Webhooks (${hooks.length})` }),
+    el('p', { className: 'hint', textContent: 'Your payment API pushes each transaction update to a webhook URL and the bot posts a Failed / Pending / Success notification.' + (fn.enabled ? '' : ' This function is switched off, so deliveries are accepted but ignored.') }));
+
+  for (const w of hooks) {
+    const kinds = [w.notify.failed && '❌ Failed', w.notify.pending && '⏳ Pending', w.notify.success && '✅ Success'].filter(Boolean);
+    const streaks = [w.streak?.failed && `🚨 ${w.streak.failed} failed in a row`, w.streak?.pending && `⏳ ${w.streak.pending} pending in a row`].filter(Boolean);
+    const usesHeader = w.auth === 'header' || w.auth === 'hmac';
+    const usesMaster = usesHeader && w.secretSource !== 'own';
+
+    // secret row: own secret (show / copy / regenerate) or the function's master key/secret
+    let secretCell;
+    let secretActions = '';
+    if (usesMaster) {
+      secretCell = el('span', { textContent: `Uses the ${SECRET_TEXT[w.secretSource]}` });
+    } else {
+      const code = el('code', { textContent: '•'.repeat(16) });
+      let shown = false;
+      const showBtn = el('button', { type: 'button', textContent: 'Show' });
+      showBtn.onclick = () => { shown = !shown; code.textContent = shown ? w.secret : '•'.repeat(16); showBtn.textContent = shown ? 'Hide' : 'Show'; };
+      secretCell = code;
+      secretActions = el('span', {}, showBtn, ' ', copyButton('Copy', () => w.secret), ' ',
+        confirmButton('New secret', () => api('POST', `/api/webhooks/${w.id}/secret`), 'New secret generated – update it at your provider', loadFunctions));
+    }
+
+    const info = el('table', {},
+      el('tr', {}, el('td', { className: 'muted', textContent: 'Webhook URL' }),
+        el('td', {}, el('code', { className: 'url', style: 'max-width:420px', textContent: webhookUrl(w), title: webhookUrl(w) })),
+        el('td', { className: 'actions' }, copyButton('Copy URL', () => webhookUrl(w)))),
+      usesHeader ? el('tr', {}, el('td', { className: 'muted', textContent: w.auth === 'hmac' ? 'Signature header' : 'Header' }),
+        el('td', {}, el('code', { textContent: w.headerName })), el('td')) : '',
+      w.auth === 'none' ? el('tr', {}, el('td', { className: 'muted', textContent: 'Security' }),
+        el('td', { textContent: 'No secret – anyone with this URL can post. Keep it private.' }), el('td')) : el('tr', {},
+        el('td', { className: 'muted', textContent: w.auth === 'hmac' ? 'Signing secret' : 'Secret' }),
+        el('td', {}, secretCell),
+        el('td', { className: 'actions' }, secretActions)));
+
+    const actions = el('div', { className: 'row-actions' });
+    const tests = [['failed_streak', `Test ${w.streak?.failed || 5} failed`], ['pending_streak', `Test ${w.streak?.pending || 5} pending`],
+      ['failed', 'Test single failed'], ['pending', 'Test single pending'], ['success', 'Test single success']];
+    for (const [kind, label] of tests) {
+      const b = el('button', { type: 'button', textContent: label });
+      b.onclick = () => run(b, () => api('POST', `/api/webhooks/${w.id}/test`, { kind }), 'Test alert sent').then(loadFunctions);
+      actions.append(b);
+    }
+    const edit = el('button', { type: 'button', textContent: 'Edit webhook' });
+    edit.onclick = () => openWhEditor(w, fn);
+    actions.append(edit, confirmButton('Delete webhook', () => api('DELETE', `/api/webhooks/${w.id}`), 'Webhook deleted', loadFunctions));
+
+    // recent deliveries
+    const dl = whData.deliveries[w.id] || [];
+    const dTable = el('table');
+    if (!dl.length) {
+      dTable.append(el('tr', {}, el('td', { className: 'empty', colSpan: 3, textContent: 'No deliveries yet (since the bot last started).' })));
+    } else {
+      dTable.append(el('tr', {}, el('th', { textContent: 'Received' }), el('th', { textContent: 'Result' }), el('th', { textContent: 'Transactions' })));
+      for (const d of dl) {
+        const ok = d.httpStatus === 200;
+        const txns = el('td');
+        if (d.note) txns.append(el('div', { className: 'muted', textContent: d.note }));
+        for (const t of d.txns) {
+          txns.append(el('div', {},
+            el('code', { textContent: t.id || '?' }), ` ${t.status || '?'} `,
+            el('span', { className: `tag ${t.kind === 'failed' ? 'low' : t.kind === 'success' ? 'ok' : ''}`, textContent: t.kind }),
+            t.streak ? el('span', { className: 'muted', textContent: ` ${t.streak} ` }) : '',
+            t.notified ? el('span', { className: 'tag ok', textContent: 'notified' }) : t.note ? el('span', { className: 'muted', textContent: t.note }) : ''));
+        }
+        if (d.body) {
+          txns.append(el('details', {}, el('summary', { className: 'muted', style: 'cursor:pointer', textContent: 'Payload' }),
+            el('pre', { style: 'white-space:pre-wrap;word-break:break-all;margin:6px 0 0;font-size:12px', textContent: prettyJson(d.body) })));
+        }
+        dTable.append(el('tr', {},
+          el('td', { className: 'muted', textContent: fmt(d.at) }),
+          el('td', {}, el('span', { className: `tag ${ok ? 'ok' : 'low'}`, textContent: ok ? '✓ 200' : `✗ ${d.httpStatus}` })),
+          txns));
+      }
+    }
+
+    block.append(el('div', { className: 'webhook' + (w.enabled ? '' : ' dim') },
+      el('h3', {}, '🔗 ', w.name, w.enabled ? '' : el('span', { className: 'tag', textContent: 'Disabled' })),
+      el('p', { className: 'hint', textContent:
+        `Alerts: ${[...streaks, ...kinds.map((k) => k + ' (each)')].join(', ') || 'nothing'} · to ${w.chatIds || 'all alert chats'} · ${AUTH_TEXT[w.auth]}` +
+        (w.feedStreaks ? ' · also counted in /failures' : '') }),
+      el('div', { className: 'table-wrap' }, info),
+      actions,
+      el('details', { open: dl.some((d) => d.httpStatus !== 200) },
+        el('summary', { className: 'muted', style: 'cursor:pointer;margin-top:10px', textContent: `Recent deliveries (${dl.length})` }),
+        el('div', { className: 'table-wrap' }, dTable))));
+  }
+  block.append(el('div', { className: 'row-actions' }, add));
+  return block;
+}
+
+function prettyJson(s) {
+  try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
+}
+
+function syncWhForm() {
+  const form = $('#wh-form');
+  const f = form.elements;
+  const auth = f.namedItem('auth').value;
+  const src = f.namedItem('secretSource');
+  const usesHeader = auth === 'header' || auth === 'hmac';
+  if (!usesHeader) src.value = 'own';
+  form.querySelectorAll('[data-hdr]').forEach((n) => (n.hidden = !usesHeader));
+  form.querySelector('[data-own-secret]').hidden = auth === 'none' || src.value !== 'own';
+  const hdr = f.namedItem('headerName');
+  if (!hdr.value || ['X-Webhook-Secret', 'X-Signature'].includes(hdr.value)) hdr.value = auth === 'hmac' ? 'X-Signature' : 'X-Webhook-Secret';
+  const which = src.value === 'own' ? 'the secret below' : `the ${SECRET_TEXT[src.value]}`;
+  $('#wh-auth-hint').textContent = {
+    none: 'No check – the vendor just posts to the URL. The URL contains a long random ID; keep it private, anyone who has it can send data.',
+    url: 'The secret is part of the URL – just paste the URL into your provider. Simplest, but the URL itself must be kept private.',
+    header: `Your provider sends ${which} in this header on every call (a "Bearer " prefix is accepted).`,
+    hmac: `Your provider signs the request body with ${which} (HMAC-SHA256, hex or base64, optional "sha256=" prefix).`,
+  }[auth];
+}
+$('#wh-form').addEventListener('change', syncWhForm);
+
+function openWhEditor(w, fn) {
+  const form = $('#wh-form');
+  form.reset();
+  const f = form.elements;
+  const d = whData.defaults;
+  f.namedItem('id').value = w?.id || '';
+  f.namedItem('fnId').value = fn.id;
+  f.namedItem('name').value = w?.name || '';
+  f.namedItem('enabled').checked = w ? w.enabled : true;
+  f.namedItem('nFailed').checked = w ? w.notify.failed : false;
+  f.namedItem('nPending').checked = w ? w.notify.pending : false;
+  f.namedItem('nSuccess').checked = w ? w.notify.success : false;
+  f.namedItem('streakFailed').value = w?.streak?.failed ?? 5;
+  f.namedItem('streakPending').value = w?.streak?.pending ?? 5;
+  f.namedItem('chatIds').value = w?.chatIds || '';
+  f.namedItem('feedStreaks').checked = w ? w.feedStreaks : false;
+  f.namedItem('auth').value = w?.auth || 'none';
+  f.namedItem('headerName').value = w?.headerName || '';
+  f.namedItem('secretSource').value = w?.secretSource || 'own';
+  f.namedItem('secret').value = '';
+  f.namedItem('secret').placeholder = w ? 'leave blank to keep the current secret' : 'leave blank to generate one';
+  f.namedItem('sFailed').value = w?.statuses.failed ?? d.failed;
+  f.namedItem('sPending').value = w?.statuses.pending ?? d.pending;
+  f.namedItem('sSuccess').value = w?.statuses.success ?? d.success;
+  $('#wh-form-title').textContent = w ? `Edit webhook “${w.name}” · ${fn.name}` : `Add webhook to ${fn.name}`;
+  syncWhForm();
+  showEditor('wh');
+}
+
+$('#wh-form [data-cancel]').onclick = () => showEditor(null);
+
+$('#wh-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const f = ev.target.elements;
+  const v = (k) => f.namedItem(k).value.trim();
+  const c = (k) => f.namedItem(k).checked;
+  const body = {
+    fnId: v('fnId'), name: v('name'), enabled: c('enabled'),
+    notify: { failed: c('nFailed'), pending: c('nPending'), success: c('nSuccess') },
+    streak: { failed: Number(v('streakFailed')), pending: Number(v('streakPending')) },
+    chatIds: v('chatIds'), feedStreaks: c('feedStreaks'),
+    auth: v('auth'), headerName: v('headerName'), secretSource: v('secretSource'), secret: v('secret'),
+    statuses: { failed: v('sFailed'), pending: v('sPending'), success: v('sSuccess') },
+  };
+  if (v('id')) body.id = v('id');
+  run(ev.target.querySelector('button.primary'), async () => {
+    await api('POST', '/api/webhooks', body);
+    showEditor(null);
+  }, 'Webhook saved').then(loadFunctions);
+});
+
+// keep delivery lists fresh while the Functions tab is open (not while editing)
+setInterval(() => {
+  if (!$('#tab-functions').hidden && $('#fn-editor').hidden && $('#api-editor').hidden && $('#wh-editor').hidden) loadFunctions();
+}, 15000);
+
+// --- commands ---
+function toggleButton(on, onClick, locked) {
+  const b = el('button', { type: 'button', className: `toggle ${on ? 'on' : 'off'}`, textContent: on ? '● Active' : '○ Inactive' });
+  if (locked) { b.disabled = true; b.title = 'Always active'; }
+  b.onclick = () => onClick(!on, b);
+  return b;
+}
+
+async function loadCommands() {
+  let data;
+  try { data = await api('GET', '/api/commands'); }
+  catch (e) { return toast('Failed to load commands: ' + e.message, true); }
+
+  const table = $('#cmds');
+  table.replaceChildren(el('tr', {},
+    el('th', { textContent: 'Status' }), el('th', { textContent: 'Command' }),
+    el('th', { textContent: 'Description (shown in /help)' }), el('th', { textContent: 'What it does' }), el('th')));
+
+  for (const c of data.commands) {
+    const cmdIn = el('input', { value: c.command, autocomplete: 'off', spellcheck: false });
+    const descIn = el('input', { value: c.description, autocomplete: 'off' });
+    const save = el('button', { type: 'button', className: 'primary', textContent: 'Save', disabled: true });
+    const dirty = () => (save.disabled = cmdIn.value.trim().replace(/^\//, '').toLowerCase() === c.command && descIn.value.trim() === c.description);
+    cmdIn.oninput = descIn.oninput = dirty;
+    const saveBody = (enabled) => ({ command: cmdIn.value.trim(), description: descIn.value.trim(), enabled });
+    save.onclick = () => run(save, () => api('POST', `/api/commands/${c.key}`, saveBody(c.enabled)), `Saved /${cmdIn.value.trim().replace(/^\//, '')}`).then(loadCommands);
+    const toggle = toggleButton(c.enabled, (enabled, b) =>
+      run(b, () => api('POST', `/api/commands/${c.key}`, { command: c.command, description: c.description, enabled }),
+        `/${c.command} ${enabled ? 'activated' : 'deactivated'}`).then(loadCommands), c.locked);
+
+    const what = el('td', { className: 'what muted', textContent: c.what });
+    if (c.command !== c.defaultCommand) what.append(el('div', { textContent: `Originally /${c.defaultCommand}` }));
+    table.append(el('tr', { className: c.enabled ? '' : 'dim' },
+      el('td', {}, toggle),
+      el('td', {}, el('div', { className: 'cmd-input' }, el('span', { textContent: '/' }), cmdIn)),
+      el('td', {}, descIn),
+      what,
+      el('td', { className: 'actions' }, save)));
+  }
+
+  const fnTable = $('#fncmds');
+  $('#fncmds-count').textContent = data.functions.length;
+  fnTable.replaceChildren();
+  if (!data.functions.length) {
+    fnTable.append(el('tr', {}, el('td', { className: 'empty', colSpan: 4, textContent: 'No functions yet – create one in the Functions tab.' })));
+  } else {
+    fnTable.append(el('tr', {},
+      el('th', { textContent: 'Status' }), el('th', { textContent: 'Command' }), el('th', { textContent: 'Description' }), el('th')));
+    for (const f of data.functions) {
+      const toggle = toggleButton(f.enabled, (enabled, b) =>
+        run(b, () => api('POST', `/api/functions/${encodeURIComponent(f.id)}/enabled`, { enabled }),
+          `/${f.command} ${enabled ? 'activated' : 'deactivated'}`).then(loadCommands));
+      const edit = el('button', { type: 'button', textContent: 'Edit in Functions' });
+      edit.onclick = () => showTab('functions');
+      fnTable.append(el('tr', { className: f.enabled ? '' : 'dim' },
+        el('td', {}, toggle),
+        el('td', {}, el('code', { textContent: '/' + f.command })),
+        el('td', { textContent: f.description || f.name }),
+        el('td', { className: 'actions' }, edit)));
+    }
+  }
+
+  // help text is Telegram HTML – show it as plain text
+  $('#help-preview').textContent = new DOMParser().parseFromString(data.help, 'text/html').body.textContent;
+}
+
+// --- chats ---
+let chatData = null;
+
+async function loadChats() {
+  try { chatData = await api('GET', '/api/chats'); }
+  catch (e) { return toast('Failed to load chats: ' + e.message, true); }
+  const ac = chatData.autoClear || {};
+  const f = $('#autoclear-form').elements;
+  // don't overwrite what the admin is typing
+  if (!$('#autoclear-form').contains(document.activeElement)) {
+    f.namedItem('enabled').checked = !!ac.enabled;
+    f.namedItem('mode').value = ac.mode || 'rolling';
+    f.namedItem('time').value = ac.time || '03:00';
+    f.namedItem('olderThanHours').value = ac.olderThanHours ?? 24;
+  }
+  $('#ac-tz').textContent = chatData.timezone;
+  $('#ac-last').textContent = chatData.lastAutoClear ? `Last run: ${fmt(chatData.lastAutoClear)}` : 'Not run yet';
+  syncAutoClearForm();
+  renderChats();
+}
+
+function syncAutoClearForm() {
+  const f = $('#autoclear-form').elements;
+  const daily = f.namedItem('mode').value === 'daily';
+  $('#ac-time-wrap').hidden = !daily;
+  f.namedItem('olderThanHours').min = daily ? 0 : 1;
+  const h = f.namedItem('olderThanHours').value;
+  $('#ac-summary').textContent = !f.namedItem('enabled').checked ? 'Auto-clear is off.'
+    : daily
+      ? `Every day at ${f.namedItem('time').value || '—'}, delete bot messages older than ${h} hour(s)${h === '0' ? ' (everything)' : ''}.`
+      : `Every 10 minutes, delete bot messages older than ${h} hour(s).`;
+}
+$('#autoclear-form').addEventListener('input', syncAutoClearForm);
+
+$('#autoclear-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const f = ev.target.elements;
+  const body = {
+    enabled: f.namedItem('enabled').checked,
+    mode: f.namedItem('mode').value,
+    time: f.namedItem('time').value,
+    olderThanHours: Number(f.namedItem('olderThanHours').value),
+  };
+  run(ev.target.querySelector('button.primary'), () => api('POST', '/api/chats/auto-clear', body), 'Auto-clear saved').then(loadChats);
+});
+
+const clearResult = (r) => `Deleted ${r.deleted} message(s)` + (r.failed ? ` · ${r.failed} could not be deleted` : '');
+
+function renderChats() {
+  const rows = (chatData?.chats || []).sort((a, b) => b.messages - a.messages);
+  $('#chats-count').textContent = rows.length;
+
+  const wrap = $('#clear-all-wrap');
+  wrap.replaceChildren(confirmButton('Clear all chats', async () => {
+    const r = await api('POST', '/api/chats/clear', {});
+    toast(clearResult(r));
+  }, null, loadChats));
+
+  const table = $('#chats');
+  table.replaceChildren();
+  if (!rows.length) {
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 5, textContent: 'No chats yet.' })));
+    return;
+  }
+  table.append(el('tr', {},
+    el('th', { textContent: 'Chat' }), el('th', { textContent: 'Messages', className: 'num' }),
+    el('th', { textContent: 'Oldest' }), el('th', { textContent: 'Newest' }), el('th')));
+  for (const c of rows) {
+    const clear = confirmButton('Clear now', async () => {
+      const r = await api('POST', '/api/chats/clear', { chatId: c.chatId });
+      toast(clearResult(r));
+    }, null, loadChats);
+    clear.disabled = !c.messages;
+    table.append(el('tr', {},
+      el('td', {},
+        el('div', { textContent: c.label || (c.isAlertChat ? 'Alert chat' : 'Chat') }),
+        el('code', { className: 'muted', textContent: c.chatId })),
+      el('td', { className: 'num', textContent: c.deletable === c.messages ? c.messages : `${c.messages} (${c.deletable} deletable)` }),
+      el('td', { className: 'muted', textContent: fmt(c.oldest) || '—' }),
+      el('td', { className: 'muted', textContent: fmt(c.newest) || '—' }),
+      el('td', { className: 'actions' }, clear)));
+  }
+}
+
+// --- settings ---
+let settingsData = null;
+
+async function loadSettings() {
+  try { settingsData = await api('GET', '/api/settings'); }
+  catch (e) { return toast('Failed to load settings: ' + e.message, true); }
+  const s = settingsData;
+
+  const status = $('#bot-status');
+  status.replaceChildren();
+  if (s.bot) {
+    status.append(el('span', { className: 'dot on' }), `Connected as @${s.bot.username}`,
+      el('span', { className: 'muted', textContent: ` · token ${s.telegram.tokenHint}` }));
+  } else {
+    status.append(el('span', { className: 'dot off' }),
+      s.telegram.configured ? `Not connected – token ${s.telegram.tokenHint} was rejected or Telegram is unreachable (see Logs)` : 'No bot token set – the bot is not running');
+  }
+
+}
+$('#token-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const form = ev.target;
+  const token = form.elements.namedItem('token').value.trim();
+  run(form.querySelector('button'), async () => {
+    const r = await api('POST', '/api/settings/bot-token', { token });
+    form.reset();
+    toast(`Bot connected as @${r.bot?.username}`);
+  }).then(loadSettings);
+});
+
+// --- functions ---
+let fnData = null;
+const OP_TEXT = { '<': 'below', '<=': 'at or below', '>': 'above', '>=': 'at or above', '==': 'equal to', '!=': 'not equal to' };
+const KEY_TEXT = { master: 'Master key', own: 'Own key', none: 'No key' };
+
+async function loadFunctions() {
+  try { [fnData] = await Promise.all([api('GET', '/api/functions'), loadWebhooks()]); }
+  catch (e) { return toast('Failed to load functions: ' + e.message, true); }
+  renderFunctions();
+}
+
+function valueText(a) {
+  if (a.valueMode === 'count') return `count of items${a.valuePath ? ` in ${a.valuePath}` : ''}`;
+  if (a.valueMode === 'sum') return `sum of ${a.sumField}${a.valuePath ? ` in ${a.valuePath}` : ''}`;
+  return `field ${a.valuePath}`;
+}
+
+function renderFunctions() {
+  const list = $('#fn-list');
+  list.replaceChildren();
+  for (const fn of fnData.functions) {
+    const custom = !fn.builtin;
+    const activeAlerts = Object.keys(fnData.activeAlerts).filter((k) => k.startsWith(fn.id + ':')).length;
+
+    const title = el('h2', {}, fn.name,
+      fn.builtin ? el('span', { className: 'tag', textContent: 'Built-in' }) : el('code', { className: 'tag', textContent: '/' + fn.command }),
+      fn.enabled ? '' : el('span', { className: 'tag', textContent: 'Disabled' }),
+      activeAlerts ? el('span', { className: 'tag low', textContent: `${activeAlerts} alert(s) active` }) : '');
+
+    const bits = [];
+    if (fn.description) bits.push(fn.description);
+    bits.push(`Master key: ${fn.master.keyHint || fn.master.secretHint ? `${fn.master.keyHint || '—'} / ${fn.master.secretHint || '—'}` : 'not set'}`);
+    if (custom) {
+      const m = fn.monitor || {};
+      bits.push(m.enabled
+        ? `Alerts when value is ${OP_TEXT[m.op]} ${m.threshold}, checked every ${m.everyMin} min` + (fnData.lastRun[fn.id] ? ` · last check ${fmt(fnData.lastRun[fn.id])}` : '')
+        : 'Alerts off – command only');
+    }
+    const hint = el('p', { className: 'hint', textContent: bits.join(' · ') });
+
+    const table = el('table');
+    if (!fn.apis.length) {
+      table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 5, textContent: 'No APIs yet.' })));
+    } else {
+      table.append(el('tr', {},
+        el('th', { textContent: 'API' }), el('th', { textContent: 'URL' }), el('th', { textContent: 'Key' }),
+        custom ? el('th', { textContent: 'Value' }) : '', el('th')));
+      for (const a of fn.apis) {
+        const test = el('button', { type: 'button', textContent: 'Test' });
+        test.onclick = async () => {
+          test.disabled = true;
+          try {
+            const r = await api('POST', `/api/functions/${encodeURIComponent(fn.id)}/apis/${encodeURIComponent(a.id)}/test`);
+            toast(r.ok
+              ? `✓ HTTP ${r.status} in ${r.ms} ms` + (r.value !== undefined ? ` · value ${r.value}` : ` · ${r.items} item(s)`) +
+                (r.fields.length ? ` · fields: ${r.fields.slice(0, 8).join(', ')}` : '')
+              : `✗ ${r.error}`, !r.ok);
+          } catch (err) { toast(err.message, true); }
+          finally { test.disabled = false; }
+        };
+        const edit = el('button', { type: 'button', textContent: 'Edit' });
+        edit.onclick = () => openApiEditor(fn, a);
+        const del = confirmButton('Delete', () => api('DELETE', `/api/functions/${encodeURIComponent(fn.id)}/apis/${encodeURIComponent(a.id)}`), 'API deleted', loadFunctions);
+        const keyCell = a.keyMode === 'own' ? `Own · ${a.keyHint || a.secretHint || '—'}` : KEY_TEXT[a.keyMode];
+        table.append(el('tr', { className: a.enabled ? '' : 'dim' },
+          el('td', {}, el('div', { textContent: a.name }), a.enabled ? '' : el('span', { className: 'tag', textContent: 'Disabled' })),
+          el('td', {}, el('code', { className: 'url', textContent: `${a.method && a.method !== 'GET' ? a.method + ' ' : ''}${a.url}`, title: a.url })),
+          el('td', { textContent: keyCell }),
+          custom ? el('td', { className: 'muted', textContent: valueText(a) }) : '',
+          el('td', { className: 'actions' }, test, edit, del)));
+      }
+    }
+
+    const actions = el('div', { className: 'row-actions' });
+    const addApi = el('button', { type: 'button', className: 'primary', textContent: '+ Add API' });
+    addApi.onclick = () => openApiEditor(fn);
+    const editFn = el('button', { type: 'button', textContent: 'Edit function' });
+    editFn.onclick = () => openFnEditor(fn);
+    actions.append(addApi, editFn);
+    if (custom && fn.monitor?.enabled) {
+      const runNow = el('button', { type: 'button', textContent: 'Check now' });
+      runNow.onclick = () => run(runNow, () => api('POST', `/api/functions/${encodeURIComponent(fn.id)}/run`), 'Check complete – alerts sent if needed').then(loadFunctions);
+      actions.append(runNow);
+    }
+    if (custom) {
+      actions.append(confirmButton('Delete function', () => api('DELETE', `/api/functions/${encodeURIComponent(fn.id)}`), 'Function deleted', loadFunctions));
+    }
+
+    // Transaction failures: its webhooks are managed right here
+    const extra = fn.builtin === 'transactions' ? webhooksBlock(fn) : '';
+    list.append(el('section', {}, title, hint, el('div', { className: 'table-wrap' }, table), actions, extra));
+  }
+}
+
+function showEditor(which) {
+  const ids = { fn: '#fn-editor', api: '#api-editor', wh: '#wh-editor' };
+  for (const [k, id] of Object.entries(ids)) $(id).hidden = which !== k;
+  if (which) $(ids[which]).scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function openFnEditor(fn) {
+  const form = $('#fn-form');
+  form.reset();
+  const f = form.elements;
+  const custom = !fn || !fn.builtin;
+  form.querySelectorAll('[data-custom]').forEach((n) => (n.hidden = !custom));
+  f.namedItem('command').required = custom;
+  f.namedItem('id').value = fn?.id || '';
+  $('#fn-form-title').textContent = fn ? `Edit function “${fn.name}”` : 'New function';
+  f.namedItem('mkey').placeholder = fn?.master.keyHint ? `${fn.master.keyHint} – leave blank to keep` : '';
+  f.namedItem('msecret').placeholder = fn?.master.secretHint ? `${fn.master.secretHint} – leave blank to keep` : '';
+  if (fn) {
+    f.namedItem('name').value = fn.name;
+    f.namedItem('command').value = fn.command || '';
+    f.namedItem('description').value = fn.description || '';
+    f.namedItem('enabled').checked = fn.enabled;
+    f.namedItem('mkeyHeader').value = fn.master.keyHeader ?? '';
+    f.namedItem('msecretHeader').value = fn.master.secretHeader ?? '';
+    const m = fn.monitor || {};
+    if (custom) {
+      f.namedItem('monEnabled').checked = !!m.enabled;
+      f.namedItem('everyMin').value = m.everyMin ?? 5;
+      f.namedItem('op').value = m.op || '<';
+      f.namedItem('threshold').value = m.threshold ?? 100;
+      f.namedItem('remindMin').value = m.remindMin ?? 60;
+      f.namedItem('format').value = fn.format || 'number';
+    }
+  }
+  showEditor('fn');
+}
+
+$('#new-fn').onclick = () => openFnEditor(null);
+$('#fn-form [data-cancel]').onclick = () => showEditor(null);
+
+$('#fn-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const f = ev.target.elements;
+  const v = (k) => f.namedItem(k).value.trim();
+  const body = {
+    name: v('name'), command: v('command'), description: v('description'), enabled: f.namedItem('enabled').checked,
+    master: { key: v('mkey'), secret: v('msecret'), keyHeader: v('mkeyHeader'), secretHeader: v('msecretHeader') },
+    monitor: {
+      enabled: f.namedItem('monEnabled').checked, everyMin: Number(v('everyMin')), op: v('op'),
+      threshold: Number(v('threshold')), remindMin: Number(v('remindMin')),
+    },
+    format: v('format'),
+  };
+  if (v('id')) body.id = v('id');
+  run(ev.target.querySelector('button.primary'), async () => {
+    await api('POST', '/api/functions', body);
+    showEditor(null);
+  }, 'Function saved').then(loadFunctions);
+});
+
+function syncApiForm() {
+  const form = $('#api-form');
+  const f = form.elements;
+  const fn = fnData?.functions.find((x) => x.id === f.namedItem('fnId').value);
+  const custom = fn && !fn.builtin;
+  form.querySelectorAll('[data-custom]').forEach((n) => (n.hidden = !custom));
+  form.querySelectorAll('[data-txn]').forEach((n) => (n.hidden = fn?.builtin !== 'transactions'));
+  form.querySelector('[data-own]').hidden = f.namedItem('keyMode').value !== 'own';
+  const mode = f.namedItem('valueMode').value;
+  form.querySelector('[data-sum]').hidden = mode !== 'sum';
+  form.querySelector('[data-path-label]').textContent = mode === 'path' ? 'Field path' : 'List field (blank = auto-detect)';
+  f.namedItem('valuePath').placeholder = mode === 'path' ? 'data.count' : 'data';
+}
+$('#api-form').addEventListener('change', syncApiForm);
+
+function openApiEditor(fn, a) {
+  const form = $('#api-form');
+  form.reset();
+  const f = form.elements;
+  f.namedItem('fnId').value = fn.id;
+  f.namedItem('id').value = a?.id || '';
+  $('#api-form-title').textContent = a ? `Edit API “${a.name}” · ${fn.name}` : `Add API to ${fn.name}`;
+  f.namedItem('key').placeholder = a?.keyHint ? `${a.keyHint} – leave blank to keep` : '';
+  f.namedItem('secret').placeholder = a?.secretHint ? `${a.secretHint} – leave blank to keep` : '';
+  if (a) {
+    for (const k of ['name', 'url', 'method', 'query', 'argParam', 'sinceParam', 'keyMode', 'valueMode', 'valuePath', 'sumField']) {
+      if (a[k] !== undefined) f.namedItem(k).value = a[k];
+    }
+    if (a.keyMode === 'own') {
+      f.namedItem('keyHeader').value = a.keyHeader ?? '';
+      f.namedItem('secretHeader').value = a.secretHeader ?? '';
+    }
+    f.namedItem('enabled').checked = a.enabled;
+  } else if (fn.builtin === 'transactions') {
+    f.namedItem('sinceParam').value = 'from';
+  }
+  syncApiForm();
+  showEditor('api');
+}
+
+$('#api-form [data-cancel]').onclick = () => showEditor(null);
+
+$('#api-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const f = ev.target.elements;
+  const v = (k) => f.namedItem(k).value.trim();
+  const body = Object.fromEntries(['id', 'name', 'url', 'method', 'query', 'argParam', 'sinceParam', 'keyMode',
+    'key', 'secret', 'keyHeader', 'secretHeader', 'valueMode', 'valuePath', 'sumField'].map((k) => [k, v(k)]));
+  body.enabled = f.namedItem('enabled').checked;
+  if (!body.id) delete body.id;
+  run(ev.target.querySelector('button.primary'), async () => {
+    await api('POST', `/api/functions/${encodeURIComponent(v('fnId'))}/apis`, body);
+    showEditor(null);
+  }, 'API saved').then(loadFunctions);
+});
+
+// --- accounts ---
+const inr =(n) => Number(n).toLocaleString('en-IN', { style: 'currency', currency: 'INR' });
+let acctData = { accounts: [], blocked: [], settings: {} };
+
+async function loadAccounts() {
+  try { acctData = await api('GET', '/api/accounts'); }
+  catch (e) { return toast('Failed to load accounts: ' + e.message, true); }
+  $('#skip-inactive').checked = acctData.settings?.skipInactive !== false;
+  $('#acct-last').textContent = 'Last balance check: ' + (acctData.lastCheck ? fmt(acctData.lastCheck) : 'never');
+  renderBlocked();
+  renderAccounts();
+}
+
+function renderBlocked() {
+  const rows = acctData.blocked || [];
+  const table = $('#blocked');
+  $('#blocked-count').textContent = rows.length;
+  table.replaceChildren();
+  if (!rows.length) {
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 5, textContent: 'No blocked accounts.' })));
+    return;
+  }
+  table.append(el('tr', {},
+    el('th', { textContent: 'A/c No' }), el('th', { textContent: 'Customer' }),
+    el('th', { textContent: 'Bank' }), el('th', { textContent: 'Blocked on' }), el('th')));
+  for (const b of rows) {
+    const unblock = el('button', { textContent: 'Unblock', type: 'button' });
+    unblock.onclick = () => run(unblock, () => api('DELETE', `/api/blocked/${encodeURIComponent(b.id)}`), 'Unblocked').then(loadAccounts);
+    table.append(el('tr', {},
+      el('td', {}, el('code', { textContent: b.accountNumber || b.id })),
+      el('td', { textContent: b.label || '—', className: b.label ? '' : 'muted' }),
+      el('td', { textContent: b.bankName || '—', className: b.bankName ? '' : 'muted' }),
+      el('td', { textContent: fmt(b.addedAt), className: 'muted' }),
+      el('td', { className: 'actions' }, unblock)));
+  }
+}
+
+function renderAccounts() {
+  const skipInactive = acctData.settings?.skipInactive !== false;
+  const q = $('#acct-q').value.trim().toLowerCase();
+  const filter = $('#acct-filter').value;
+  const tracked = (a) => !a.blocked && (a.isActive || !skipInactive);
+  const rows = (acctData.accounts || [])
+    .filter((a) => !q || [a.customerName, a.bankName, a.accountNumber, a.accountId].some((v) => String(v || '').toLowerCase().includes(q)))
+    .filter((a) => !filter ||
+      (filter === 'tracked' && tracked(a)) || (filter === 'low' && a.low && tracked(a)) ||
+      (filter === 'inactive' && !a.isActive) || (filter === 'blocked' && a.blocked))
+    .sort((a, b) => a.balance - b.balance);
+
+  const table = $('#accounts');
+  $('#accounts-count').textContent = (acctData.accounts || []).length;
+  table.replaceChildren();
+  if (!rows.length) {
+    const msg = acctData.accounts?.length ? 'No accounts match.' : 'No account data yet – run a balance check.';
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 6, textContent: msg })));
+    return;
+  }
+  table.append(el('tr', {},
+    el('th', { textContent: 'Customer' }), el('th', { textContent: 'Bank' }), el('th', { textContent: 'A/c No' }),
+    el('th', { textContent: 'Balance', className: 'num' }), el('th', { textContent: 'Status' }), el('th')));
+
+  for (const a of rows) {
+    const status = el('td');
+    if (a.blocked) status.append(el('span', { className: 'tag blocked', textContent: 'Blocked' }));
+    if (!a.isActive) status.append(el('span', { className: 'tag', textContent: skipInactive ? 'Inactive · skipped' : 'Inactive' }));
+    if (tracked(a)) status.append(el('span', { className: a.low ? 'tag low' : 'tag ok', textContent: a.low ? 'Low' : 'OK' }));
+
+    const btn = el('button', { type: 'button', textContent: a.blocked ? 'Unblock' : 'Block', className: a.blocked ? '' : 'danger' });
+    btn.onclick = () => {
+      if (a.blocked) {
+        const entry = (acctData.blocked || []).find((b) => [b.id, b.accountId, b.accountNumber].some((k) => k && (k === a.accountId || k === a.accountNumber)));
+        if (!entry) return toast('Blocked entry not found', true);
+        return run(btn, () => api('DELETE', `/api/blocked/${encodeURIComponent(entry.id)}`), 'Unblocked').then(loadAccounts);
+      }
+      run(btn, () => api('POST', '/api/blocked', {
+        id: a.accountNumber || a.accountId, accountId: a.accountId, accountNumber: a.accountNumber,
+        label: a.customerName, bankName: a.bankName,
+      }), 'Account blocked').then(loadAccounts);
+    };
+
+    table.append(el('tr', { className: tracked(a) ? '' : 'dim' },
+      el('td', { textContent: a.customerName || '—' }),
+      el('td', { textContent: a.bankName || '—' }),
+      el('td', {}, el('code', { textContent: a.accountNumber || a.accountId })),
+      el('td', { className: 'num', textContent: inr(a.balance) }),
+      status,
+      el('td', { className: 'actions' }, btn)));
+  }
+}
+
+$('#acct-q').addEventListener('input', renderAccounts);
+$('#acct-filter').addEventListener('change', renderAccounts);
+
+$('#skip-inactive').addEventListener('change', async (ev) => {
+  const box = ev.target;
+  box.disabled = true;
+  try {
+    await api('POST', '/api/settings', { skipInactive: box.checked });
+    toast(box.checked ? 'Inactive accounts will be skipped' : 'Inactive accounts will be checked');
+    await loadAccounts();
+  } catch (e) {
+    box.checked = !box.checked;
+    toast(e.message, true);
+  } finally {
+    box.disabled = false;
+  }
+});
+
+$('#run-check').onclick = () => {
+  const b = $('#run-check');
+  b.textContent = 'Checking…';
+  run(b, () => api('POST', '/api/check-balances'), 'Balance check complete')
+    .then(loadAccounts)
+    .finally(() => (b.textContent = 'Run balance check now'));
+};
+
+$('#block-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const form = ev.target;
+  const f = form.elements;
+  const btn = form.querySelector('button');
+  const body = { id: f.namedItem('account').value.trim(), label: f.namedItem('label').value.trim() };
+  run(btn, async () => { await api('POST', '/api/blocked', body); form.reset(); }, 'Account blocked').then(loadAccounts);
+});
+document.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => showTab(b.dataset.tab)));
+
+// --- logs ---
+let lastSeq = 0;
+let logReq = 0;
+
+function logRow(e) {
+  return el('div', { className: 'log ' + e.level },
+    el('time', { textContent: fmt(e.ts) }),
+    el('span', { className: 'lvl', textContent: e.level }),
+    el('span', { className: 'msg', textContent: e.text }));
+}
+
+async function loadLogs(reset) {
+  const id = ++logReq;
+  const params = new URLSearchParams({
+    q: $('#log-q').value.trim(),
+    level: $('#log-level').value,
+    after: reset ? 0 : lastSeq,
+    limit: 500,
+  });
+  let data;
+  try { data = await api('GET', '/api/logs?' + params); }
+  catch (e) { return toast('Failed to load logs: ' + e.message, true); }
+  if (id !== logReq) return; // a newer request superseded this one
+
+  const box = $('#logs');
+  if (reset) box.replaceChildren();
+  box.querySelector('.empty')?.remove();
+  lastSeq = data.lastSeq;
+
+  const frag = document.createDocumentFragment();
+  for (const e of data.entries.slice().reverse()) frag.append(logRow(e)); // newest first
+  box.prepend(frag);
+  while (box.children.length > 2000) box.lastChild.remove();
+
+  if (!box.children.length) box.append(el('div', { className: 'empty', textContent: 'No log entries match.' }));
+  const n = box.querySelectorAll('.log').length;
+  $('#log-info').textContent = `${n} entr${n === 1 ? 'y' : 'ies'} shown · newest first`;
+}
+
+function syncChips() {
+  const q = $('#log-q').value.trim();
+  document.querySelectorAll('#log-chips button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.q === q)));
+}
+
+let searchTimer;
+$('#log-q').addEventListener('input', () => {
+  syncChips();
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => loadLogs(true), 300);
+});
+$('#log-level').addEventListener('change', () => loadLogs(true));
+document.querySelectorAll('#log-chips button').forEach((b) => (b.onclick = () => {
+  $('#log-q').value = b.dataset.q;
+  syncChips();
+  loadLogs(true);
+}));
+
+setInterval(() => {
+  if (!$('#tab-logs').hidden && $('#log-live').checked) loadLogs(false);
+}, 5000);
+
+// --- start ---
+load();
+setInterval(load, 30000);
+setInterval(() => { if (!$('#tab-chats').hidden) loadChats(); }, 30000);
+if (TABS.includes(location.hash.slice(1))) showTab(location.hash.slice(1));
+</script>
+</body>
+</html>
