@@ -36,8 +36,6 @@ const cfg = {
 
   skipInactive: (process.env.SKIP_INACTIVE_ACCOUNTS || 'true') === 'true',
 
-  balanceThreshold: Number(process.env.BALANCE_THRESHOLD || 3000000),
-  balanceRemindMin: Number(process.env.BALANCE_REMIND_MINUTES || 60),
   apiErrorThreshold: Number(process.env.API_ERROR_THRESHOLD || 3),
 
   balancePollSec: Number(process.env.BALANCE_POLL_SECONDS || 300),
@@ -264,11 +262,13 @@ const accessStore = {
   // every account from the last balance check, flagged for the admin panel
   accounts: () => ({
     lastCheck: state.lastBalanceCheck,
-    threshold: cfg.balanceThreshold,
+    threshold: lowLimit(),
+    levels: config.balanceLevels().levels,
     accounts: Object.values(state.accounts || {}).map((a) => ({
       ...a,
       blocked: isBlocked(a.accountId, a.accountNumber),
-      low: a.balance < cfg.balanceThreshold,
+      low: !!levelFor(a.balance),
+      level: levelFor(a.balance),
     })),
   }),
 };
@@ -387,6 +387,53 @@ async function trackApiHealth(ep, ok, err) {
 // ---------------------------------------------------------------------------
 // Balance monitor
 // ---------------------------------------------------------------------------
+// Low-balance levels (Functions → Balance check): e.g. ≤ ₹30 L 🟢 Low, ≤ ₹20 L 🟡 Low, ≤ ₹10 L 🔴 Very low.
+// Telegram can't colour text, so the colour is shown as an emoji.
+const LEVEL_ICONS = { green: '🟢', yellow: '🟡', red: '🔴' };
+
+// the lowest level the balance has reached (index 0 = highest amount), or null when not low
+function levelFor(balance) {
+  const { levels } = config.balanceLevels();
+  for (let i = levels.length - 1; i >= 0; i--) {
+    if (balance <= levels[i].amount) return { ...levels[i], index: i, icon: LEVEL_ICONS[levels[i].color] };
+  }
+  return null;
+}
+
+// top of the low range (e.g. ₹30 L) – anything above is OK
+const lowLimit = () => config.balanceLevels().levels[0].amount;
+
+const levelsLine = () => config.balanceLevels().levels
+  .map((l) => `${LEVEL_ICONS[l.color]} ${esc(l.label)} ≤ ${lakh(l.amount)}`).join(' · ');
+
+function lowBalanceText(a, lvl, prev, changed, test) {
+  const levels = config.balanceLevels().levels;
+  const prevLvl = prev?.level !== undefined ? levels[prev.level] : null;
+  let note = '';
+  if (changed && prevLvl) {
+    note = lvl.index > prev.level
+      ? `↘ dropped from ${LEVEL_ICONS[prevLvl.color]} ${esc(prevLvl.label)} (≤ ${lakh(prevLvl.amount)})\n`
+      : `↗ improved from ${LEVEL_ICONS[prevLvl.color]} ${esc(prevLvl.label)} (≤ ${lakh(prevLvl.amount)})\n`;
+  }
+  return `${lvl.icon} <b>${esc(lvl.label.toUpperCase())} BALANCE</b> – at or below ${lakh(lvl.amount)}` +
+    `${!changed ? ' (reminder)' : ''}${test ? ' (test)' : ''}\n` + note +
+    acctLines(a) +
+    `Balance: <b>${inr(a.balance)}</b> (${lakh(a.balance)})\n` +
+    (a.disputeAmount > 0 ? `Dispute amount: ${inr(a.disputeAmount)}\n` : '') +
+    (prev?.since && !changed ? `Low since: ${fmtTime(prev.since)}\n` : '') +
+    `<i>Levels: ${levelsLine()}</i>`;
+}
+
+// one sample alert per level, from the admin panel
+async function sendBalanceTest() {
+  const { levels } = config.balanceLevels();
+  for (let i = 0; i < levels.length; i++) {
+    const balance = Math.round(levels[i].amount * 0.95);
+    const a = { customerName: 'Test Customer', bankName: 'Test Bank', ifsc: 'TEST0001234', accountNumber: 'XXXXXX7854', balance, disputeAmount: 0 };
+    await notify(lowBalanceText(a, { ...levels[i], index: i, icon: LEVEL_ICONS[levels[i].color] }, null, true, true));
+  }
+}
+
 async function fetchAccountsFrom(ep) {
   const res = await apiGet(ep);
   return extractList(res.data).map(mapBalance)
@@ -413,7 +460,7 @@ async function checkBalances() {
   if (failedSources.size === results.length) { saveState(); return; }
 
   const now = Date.now();
-  const remindMs = cfg.balanceRemindMin * 60000;
+  const remindMs = (config.balanceLevels().remindMin || 0) * 60000;
   // keep last known data for APIs that failed this round, so their alerts don't reset
   const keepFailed = (obj) => Object.fromEntries(Object.entries(obj || {}).filter(([, a]) => failedSources.has(a.source)));
   state.accounts = keepFailed(state.accounts);
@@ -432,19 +479,14 @@ async function checkBalances() {
   for (const a of accounts) {
     state.balances[a.accountId] = { ...a, checkedAt: now };
     const low = state.lowBalance[a.accountId];
+    const lvl = levelFor(a.balance);
 
-    if (a.balance < cfg.balanceThreshold) {
-      const isNew = !low;
-      if (isNew || (remindMs > 0 && now - low.lastAlert >= remindMs)) {
-        await notify(
-          `${isNew ? '⚠️' : '🔁'} <b>Low Balance${isNew ? '' : ' (reminder)'}</b>\n` +
-          acctLines(a) +
-          `Balance: <b>${inr(a.balance)}</b> (${lakh(a.balance)})\n` +
-          (a.disputeAmount > 0 ? `Dispute amount: ${inr(a.disputeAmount)}\n` : '') +
-          `Threshold: ${inr(cfg.balanceThreshold)} (${lakh(cfg.balanceThreshold)})` +
-          (isNew ? '' : `\nLow since: ${fmtTime(low.since)}`)
-        );
-        state.lowBalance[a.accountId] = { since: isNew ? now : low.since, lastAlert: now, balance: a.balance };
+    if (lvl) {
+      // alert when the account enters a level or moves to another one, plus reminders
+      const changed = !low || low.level !== lvl.index;
+      if (changed || (remindMs > 0 && now - low.lastAlert >= remindMs)) {
+        await notify(lowBalanceText(a, lvl, low, changed));
+        state.lowBalance[a.accountId] = { since: low?.since || now, lastAlert: now, balance: a.balance, level: lvl.index };
       } else {
         low.balance = a.balance;
       }
@@ -1006,7 +1048,7 @@ async function balanceLookup(msg, q) {
   if (found.length > 15) return send(msg.chat.id, `${found.length} accounts match "<b>${esc(q)}</b>" – please be more specific.`);
 
   const text = found.map((a) =>
-    `${a.balance < cfg.balanceThreshold ? '🔴' : '🟢'} <b>${esc(a.customerName || '-')}</b>${a.isActive ? '' : ' <i>(inactive)</i>'}${isBlocked(a.accountId, a.accountNumber) ? ' <i>(blocked – no alerts)</i>' : ''}\n` +
+    `${levelFor(a.balance)?.icon || '✅'} <b>${esc(a.customerName || '-')}</b>${a.isActive ? '' : ' <i>(inactive)</i>'}${isBlocked(a.accountId, a.accountNumber) ? ' <i>(blocked – no alerts)</i>' : ''}\n` +
     `Bank: ${esc(a.bankName || '-')}${a.ifsc ? ` (${esc(a.ifsc)})` : ''}\n` +
     `A/c No: <code>${esc(a.accountNumber)}</code>\n` +
     `Balance: <b>${inr(a.balance)}</b> (${lakh(a.balance)})` +
@@ -1040,7 +1082,7 @@ const COMMAND_HANDLERS = {
       `<b>Status</b>\n` +
       `Last balance check: ${state.lastBalanceCheck ? fmtTime(state.lastBalanceCheck) : 'never'}\n\n` +
       `<b>Functions</b>\n${apis}\n\n` +
-      `Balance threshold: ${inr(cfg.balanceThreshold)} (${lakh(cfg.balanceThreshold)})\n` +
+      `Low-balance levels: ${levelsLine()}\n` +
       `Accounts tracked: ${Object.keys(state.balances).length}\n` +
       `Blocked accounts: ${access.blockedAccounts.length} · Inactive accounts: ${cfg.skipInactive ? 'skipped' : 'checked'}\n` +
       `Low balance now: ${Object.keys(state.lowBalance).length}\n` +
@@ -1063,19 +1105,20 @@ const COMMAND_HANDLERS = {
     const rows = Object.values(state.balances).sort((a, b) => a.balance - b.balance);
     if (!rows.length) return send(msg.chat.id, 'No balance data yet.');
     const text = rows.map((a) =>
-      `${a.balance < cfg.balanceThreshold ? '🔴' : '🟢'} <b>${esc(a.customerName || '-')}</b> | ${esc(a.bankName || '-')} | <code>${esc(a.accountNumber)}</code> | ${inr(a.balance)}`
+      `${levelFor(a.balance)?.icon || '✅'} <b>${esc(a.customerName || '-')}</b> | ${esc(a.bankName || '-')} | <code>${esc(a.accountNumber)}</code> | ${inr(a.balance)}`
     ).join('\n');
     return send(msg.chat.id, `<b>Balances</b> (lowest first)\n\n${text}`);
   },
 
   low: (msg) => {
-    const rows = Object.entries(state.lowBalance);
-    if (!rows.length) return send(msg.chat.id, '✅ All accounts above threshold.');
+    const rows = Object.entries(state.lowBalance).sort((x, y) => x[1].balance - y[1].balance);
+    if (!rows.length) return send(msg.chat.id, `✅ All accounts above ${lakh(lowLimit())}.`);
     const text = rows.map(([id, l]) => {
       const a = state.balances[id] || {};
-      return `🔴 <b>${esc(a.customerName || '-')}</b> | ${esc(a.bankName || '-')} | <code>${esc(a.accountNumber || id)}</code> | ${inr(l.balance)} | since ${fmtTime(l.since)}`;
+      const lvl = levelFor(l.balance);
+      return `${lvl?.icon || '🔴'} <b>${esc(a.customerName || '-')}</b> | ${esc(a.bankName || '-')} | <code>${esc(a.accountNumber || id)}</code> | ${inr(l.balance)}${lvl ? ` | ${esc(lvl.label)}` : ''} | since ${fmtTime(l.since)}`;
     }).join('\n');
-    return send(msg.chat.id, `<b>Low Balance Accounts</b>\n\n${text}`);
+    return send(msg.chat.id, `<b>Low Balance Accounts</b> (lowest first)\n<i>${levelsLine()}</i>\n\n${text}`);
   },
 
   // customers whose latest transactions are failed / pending in a row
@@ -1211,6 +1254,12 @@ require('./admin').startAdmin({
   settings: {
     view: () => ({ telegram: config.publicTelegram(), bot: botInfo, timezone: cfg.timezone }),
     setBotToken: changeBotToken,
+  },
+
+  // Balance check: low-balance levels
+  balanceLevels: {
+    update: (data) => config.updateBalanceLevels(data),
+    test: sendBalanceTest,
   },
 
   // Transaction failures: vendor → incoming URL
