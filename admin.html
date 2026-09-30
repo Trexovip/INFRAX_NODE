@@ -80,6 +80,11 @@
   .tag.low { color: var(--danger); border-color: currentColor; }
   .tag.blocked { color: #b26a00; border-color: currentColor; }
   .tag.ok { color: var(--ok); border-color: currentColor; }
+  .tag.lvl-green { color: var(--ok); border-color: currentColor; }
+  .tag.lvl-yellow { color: #b88600; border-color: currentColor; }
+  .tag.lvl-red { color: var(--danger); border-color: currentColor; font-weight: 600; }
+  .lvl-row { display: grid; grid-template-columns: 28px 1fr 1fr; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .lvl-row input { width: 100%; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
   tr.dim td { opacity: .6; }
   .setting { display: flex; gap: 10px; align-items: flex-start; }
@@ -921,6 +926,39 @@ function valueText(a) {
   return `field ${a.valuePath}`;
 }
 
+// --- Balance check: low-balance levels (green / yellow / red) ---
+const LEVEL_ICONS = { green: '🟢', yellow: '🟡', red: '🔴' };
+
+function balanceLevelsBlock(fn) {
+  const levels = fn.levels || [];
+  const rows = levels.map((l) => ({
+    color: l.color,
+    lakhIn: el('input', { type: 'number', min: 0.01, step: 0.01, value: +(l.amount / 100000).toFixed(2), required: true }),
+    labelIn: el('input', { value: l.label, required: true, autocomplete: 'off' }),
+  }));
+  const remindIn = el('input', { type: 'number', min: 0, max: 10080, step: 1, value: fn.remindMin ?? 60 });
+  const save = el('button', { className: 'primary', textContent: 'Save levels' });
+  const test = el('button', { type: 'button', textContent: 'Send test alerts' });
+  test.onclick = () => run(test, () => api('POST', '/api/balance-levels/test'), 'Test alerts sent – check your alert chats');
+
+  const form = el('form', { className: 'stack' },
+    el('div', { className: 'form-title', textContent: 'Low-balance levels' }),
+    el('p', { className: 'hint', textContent: 'An alert is sent when an account reaches a level (at or below the amount) and again whenever it moves to another level – down or back up. A “Balance restored” message follows when it goes above the first level.' }),
+    el('div', { className: 'lvl-row muted', style: 'font-size:12px' }, el('span'), el('span', { textContent: 'At or below (₹ lakh)' }), el('span', { textContent: 'Label in the alert' })),
+    ...rows.map((r) => el('div', { className: 'lvl-row' }, el('span', { textContent: LEVEL_ICONS[r.color], title: r.color }), r.lakhIn, r.labelIn)),
+    el('div', { className: 'fields', style: 'margin-top:8px' },
+      el('label', {}, 'Remind every (minutes, 0 = never) while an account stays at the same level', remindIn)),
+    el('div', { className: 'inline' }, save, test));
+  form.onsubmit = (ev) => {
+    ev.preventDefault();
+    run(save, () => api('POST', '/api/balance-levels', {
+      levels: rows.map((r) => ({ amount: Math.round(Number(r.lakhIn.value) * 100000), label: r.labelIn.value.trim() })),
+      remindMin: Number(remindIn.value),
+    }), 'Levels saved').then(loadFunctions);
+  };
+  return form;
+}
+
 function renderFunctions() {
   const list = $('#fn-list');
   list.replaceChildren();
@@ -995,7 +1033,8 @@ function renderFunctions() {
       actions.append(confirmButton('Delete function', () => api('DELETE', `/api/functions/${encodeURIComponent(fn.id)}`), 'Function deleted', loadFunctions));
     }
 
-    list.append(el('section', {}, title, hint, el('div', { className: 'table-wrap' }, table), actions));
+    const extra = fn.builtin === 'balance' ? balanceLevelsBlock(fn) : '';
+    list.append(el('section', {}, title, hint, el('div', { className: 'table-wrap' }, table), actions, extra));
   }
 }
 
@@ -1181,7 +1220,11 @@ function renderAccounts() {
     const status = el('td');
     if (a.blocked) status.append(el('span', { className: 'tag blocked', textContent: 'Blocked' }));
     if (!a.isActive) status.append(el('span', { className: 'tag', textContent: skipInactive ? 'Inactive · skipped' : 'Inactive' }));
-    if (tracked(a)) status.append(el('span', { className: a.low ? 'tag low' : 'tag ok', textContent: a.low ? 'Low' : 'OK' }));
+    if (tracked(a)) {
+      status.append(a.level
+        ? el('span', { className: `tag lvl-${a.level.color}`, textContent: `${LEVEL_ICONS[a.level.color]} ${a.level.label}` })
+        : el('span', { className: 'tag ok', textContent: 'OK' }));
+    }
 
     const btn = el('button', { type: 'button', textContent: a.blocked ? 'Unblock' : 'Block', className: a.blocked ? '' : 'danger' });
     btn.onclick = () => {
