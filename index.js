@@ -52,6 +52,12 @@ function writeJson(file, data) {
 
 // Bot token, functions (APIs + keys), auto-clear – editable in the admin panel
 const config = createConfigStore({ file: dataFile('CONFIG_FILE', 'config.json'), env: process.env, writeJson });
+// all project files must come from the same version – stop with a clear message on a partial deploy
+for (const m of ['balanceLevels', 'updateBalanceLevels', 'inbox', 'updateInbox', 'commands', 'updateCommand', 'publicFunctions']) {
+  if (typeof config[m] !== 'function') {
+    throw new Error(`config.js is out of date (missing ${m}) – deploy ALL project files together (index.js, config.js, admin.js, admin.html, logger.js, login.html)`);
+  }
+}
 const refreshSecrets = () => logger.setSecrets([...config.secrets(), process.env.ADMIN_PASSWORD]);
 refreshSecrets();
 
