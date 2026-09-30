@@ -179,6 +179,28 @@
   </section>
 
   <section>
+    <h2>Low-balance alerts <span class="count" id="balalerts-count">0</span></h2>
+    <p class="hint" id="balalerts-hint">Every alert sent for accounts below the threshold.</p>
+    <div class="row-actions" style="margin:0 0 14px">
+      <button type="button" class="primary" id="send-low-now">Send low-balance alerts now</button>
+      <button type="button" id="send-low-test">Send test notification</button>
+      <span class="muted">“Send now” checks balances first, then posts one message listing every account below the threshold to the alert chats.</span>
+    </div>
+    <div class="toolbar">
+      <input id="balalerts-q" type="search" placeholder="Search name, bank or account number…" autocomplete="off">
+      <select id="balalerts-type" aria-label="Type">
+        <option value="">All alerts</option>
+        <option value="low">New low balance</option>
+        <option value="reminder">Reminders</option>
+        <option value="restored">Balance restored</option>
+        <option value="manual">Sent manually</option>
+        <option value="test">Test</option>
+      </select>
+    </div>
+    <div class="table-wrap"><table id="balalerts"></table></div>
+  </section>
+
+  <section>
     <h2>Blocked accounts <span class="count" id="blocked-count">0</span></h2>
     <p class="hint">Blocked accounts get no notifications (low balance or transaction failures) and are left out of balance checks.</p>
     <form id="block-form">
@@ -291,8 +313,8 @@
         <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
       </div>
 
-      <div class="form-title">Master key <span class="muted" style="font-weight:400">– used by every API in this function that is set to “Master key”</span></div>
-      <div class="fields">
+      <div class="form-title" data-master>Master key <span class="muted" style="font-weight:400">– used by every API in this function that is set to “Master key”</span></div>
+      <div class="fields" data-master>
         <label>Key<input name="mkey" type="password" autocomplete="off"></label>
         <label>Secret<input name="msecret" type="password" autocomplete="off"></label>
         <label>Key header<input name="mkeyHeader" value="x-trexo-key" autocomplete="off"></label>
@@ -776,8 +798,141 @@ let fnData = null;
 const OP_TEXT = { '<': 'below', '<=': 'at or below', '>': 'above', '>=': 'at or above', '==': 'equal to', '!=': 'not equal to' };
 const KEY_TEXT = { master: 'Master key', own: 'Own key', none: 'No key' };
 
+// --- Transaction failures: vendor posts transactions to the callback URL ---
+let incData = null;
+
+function copyButton(label, getText) {
+  const b = el('button', { type: 'button', textContent: label });
+  b.onclick = async () => {
+    try { await navigator.clipboard.writeText(getText()); toast('Copied'); }
+    catch { toast('Copy failed – select the text and copy it manually', true); }
+  };
+  return b;
+}
+
+function prettyJson(s) {
+  try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
+}
+
+function incomingCard(fn, title) {
+  const inbox = incData.inbox;
+  const url = `${location.origin}/callback/${inbox.token}`;
+  const sec = el('section', {}, title,
+    el('p', { className: 'hint', textContent: 'Give your vendor the callback URL below – they post every failed and pending transaction to it – no secret needed, just keep the URL private. When a customer has N failed (or N pending) transactions in a row, one alert lists all N with the customer, organisation, transaction IDs and reasons.' }));
+  if (/^(localhost|127\.|\[::1\])/.test(location.hostname)) {
+    sec.append(el('div', { className: 'warn-box', textContent: 'This panel is open on localhost – your vendor cannot reach this callback URL. Use the address of your deployed bot (e.g. your Railway domain).' }));
+  }
+  if (!fn.enabled) sec.append(el('div', { className: 'warn-box', textContent: 'Transaction failures is switched off – deliveries are accepted but ignored.' }));
+
+  sec.append(el('div', { className: 'table-wrap' }, el('table', {}, el('tr', {},
+    el('td', { className: 'muted', textContent: 'Callback URL' }),
+    el('td', {}, el('code', { className: 'url', style: 'max-width:460px', textContent: url, title: url })),
+    el('td', { className: 'actions' }, copyButton('Copy URL', () => url), ' ',
+      confirmButton('New URL', () => api('POST', '/api/incoming/new-url'), 'New URL created – give it to your vendor, the old one stops working', loadFunctions))))));
+
+  // "N in a row" settings
+  const failIn = el('input', { type: 'number', min: 0, max: 50, step: 1, value: inbox.failedInRow });
+  const pendIn = el('input', { type: 'number', min: 0, max: 50, step: 1, value: inbox.pendingInRow });
+  const sF = el('input', { value: inbox.statuses.failed, autocomplete: 'off' });
+  const sP = el('input', { value: inbox.statuses.pending, autocomplete: 'off' });
+  const sS = el('input', { value: inbox.statuses.success, autocomplete: 'off' });
+  const save = el('button', { className: 'primary', textContent: 'Save' });
+  const form = el('form', { className: 'stack' },
+    el('div', { className: 'form-title', textContent: 'Alerts' }),
+    el('div', { className: 'fields' },
+      el('label', {}, '🚨 Alert after this many failed in a row (0 = off)', failIn),
+      el('label', {}, '⏳ Alert after this many pending in a row (0 = off)', pendIn)),
+    el('details', { style: 'margin-bottom:12px' },
+      el('summary', { className: 'muted', style: 'cursor:pointer', textContent: 'Status words (advanced)' }),
+      el('div', { className: 'fields', style: 'margin-top:10px' },
+        el('label', {}, 'Failed', sF), el('label', {}, 'Pending', sP), el('label', {}, 'Success (ends a streak)', sS)),
+      el('p', { className: 'hint', textContent: 'Comma-separated. The status is read from status / txn_status, or from the event name (e.g. payment.failed).' })),
+    el('p', { className: 'hint', textContent: 'The alert repeats at 2×, 3× … and a “Failures stopped / Pending cleared” message follows when the customer\'s latest transaction is no longer failed / pending.' }),
+    el('div', { className: 'inline' }, save));
+  form.onsubmit = (ev) => {
+    ev.preventDefault();
+    run(save, () => api('POST', '/api/incoming', {
+      failedInRow: Number(failIn.value), pendingInRow: Number(pendIn.value),
+      statuses: { failed: sF.value.trim(), pending: sP.value.trim(), success: sS.value.trim() },
+    }), 'Saved').then(loadFunctions);
+  };
+  sec.append(form);
+
+  const actions = el('div', { className: 'row-actions' });
+  for (const [kind, n] of [['failed', inbox.failedInRow], ['pending', inbox.pendingInRow]]) {
+    const b = el('button', { type: 'button', textContent: `Test ${n || 5} ${kind} alert` });
+    b.onclick = () => run(b, () => api('POST', '/api/incoming/test', { kind }), 'Test alert sent').then(loadFunctions);
+    actions.append(b);
+  }
+  const editFn = el('button', { type: 'button', textContent: 'Edit function' });
+  editFn.onclick = () => openFnEditor(fn);
+  actions.append(editFn);
+  sec.append(actions);
+
+  // customers currently failed / pending in a row
+  const st = el('table');
+  if (!incData.streaks.length) {
+    st.append(el('tr', {}, el('td', { className: 'empty', colSpan: 4, textContent: 'No customers with failed or pending transactions in a row.' })));
+  } else {
+    st.append(el('tr', {}, el('th', { textContent: 'Customer' }), el('th', { textContent: 'Organisation' }),
+      el('th', { textContent: 'In a row' }), el('th', { textContent: 'Latest transaction' })));
+    for (const s of incData.streaks) {
+      const failed = s.failed > 0;
+      const n = s.failed || s.pending;
+      const limit = failed ? inbox.failedInRow : inbox.pendingInRow;
+      st.append(el('tr', {},
+        el('td', {}, el('div', { textContent: s.name || '—' }), s.customerId ? el('code', { className: 'muted', textContent: s.customerId }) : ''),
+        el('td', { textContent: s.org || '—' }),
+        el('td', {}, el('span', { className: `tag ${failed ? 'low' : ''}`, textContent: `${n}${limit ? '/' + limit : ''} ${failed ? 'failed' : 'pending'}` })),
+        el('td', {}, el('code', { textContent: s.last?.id || '' }), el('div', { className: 'muted', textContent: s.last?.reason || '' }))));
+    }
+  }
+  sec.append(el('details', { open: incData.streaks.length > 0 },
+    el('summary', { className: 'muted', style: 'cursor:pointer;margin-top:12px', textContent: `Customers in a row now (${incData.streaks.length})` }),
+    el('div', { className: 'table-wrap' }, st)));
+
+  // recent deliveries
+  const dl = incData.deliveries;
+  const dt = el('table');
+  if (!dl.length) {
+    dt.append(el('tr', {}, el('td', { className: 'empty', colSpan: 3, textContent: 'No deliveries yet (since the bot last started).' })));
+  } else {
+    dt.append(el('tr', {}, el('th', { textContent: 'Received' }), el('th', { textContent: 'Result' }), el('th', { textContent: 'Transactions' })));
+    for (const d of dl) {
+      const ok = d.httpStatus === 200;
+      const cell = el('td');
+      if (d.note) cell.append(el('div', { className: 'muted', textContent: d.note }));
+      for (const t of d.txns) {
+        cell.append(el('div', {},
+          el('code', { textContent: t.id || '?' }), ` ${t.status || '?'} `,
+          el('span', { className: `tag ${t.kind === 'failed' ? 'low' : t.kind === 'success' ? 'ok' : ''}`, textContent: t.kind }),
+          t.streak ? el('span', { className: 'muted', textContent: ` ${t.streak}` }) : '',
+          t.note ? el('span', { className: 'muted', textContent: ` (${t.note})` }) : ''));
+      }
+      if (d.body) {
+        cell.append(el('details', {}, el('summary', { className: 'muted', style: 'cursor:pointer', textContent: 'Payload' }),
+          el('pre', { style: 'white-space:pre-wrap;word-break:break-all;margin:6px 0 0;font-size:12px', textContent: prettyJson(d.body) })));
+      }
+      dt.append(el('tr', {},
+        el('td', { className: 'muted', textContent: fmt(d.at) }),
+        el('td', {}, el('span', { className: `tag ${ok ? 'ok' : 'low'}`, textContent: ok ? '✓ 200' : `✗ ${d.httpStatus}` })),
+        cell));
+    }
+  }
+  sec.append(el('details', { open: dl.some((d) => d.httpStatus !== 200) },
+    el('summary', { className: 'muted', style: 'cursor:pointer;margin-top:10px', textContent: `Recent deliveries (${dl.length})` }),
+    el('div', { className: 'table-wrap' }, dt)));
+  return sec;
+}
+
+// keep streaks / deliveries fresh while the Functions tab is open (not while editing)
+setInterval(() => {
+  const editing = !$('#fn-editor').hidden || !$('#api-editor').hidden || document.activeElement?.closest?.('#fn-list form');
+  if (!$('#tab-functions').hidden && !editing) loadFunctions();
+}, 15000);
+
 async function loadFunctions() {
-  try { fnData = await api('GET', '/api/functions'); }
+  try { [fnData, incData] = await Promise.all([api('GET', '/api/functions'), api('GET', '/api/incoming')]); }
   catch (e) { return toast('Failed to load functions: ' + e.message, true); }
   renderFunctions();
 }
@@ -799,6 +954,9 @@ function renderFunctions() {
       fn.builtin ? el('span', { className: 'tag', textContent: 'Built-in' }) : el('code', { className: 'tag', textContent: '/' + fn.command }),
       fn.enabled ? '' : el('span', { className: 'tag', textContent: 'Disabled' }),
       activeAlerts ? el('span', { className: 'tag low', textContent: `${activeAlerts} alert(s) active` }) : '');
+
+    // Transaction failures has no APIs – the vendor posts transactions to its callback URL
+    if (fn.builtin === 'transactions') { list.append(incomingCard(fn, title)); continue; }
 
     const bits = [];
     if (fn.description) bits.push(fn.description);
@@ -875,6 +1033,7 @@ function openFnEditor(fn) {
   const f = form.elements;
   const custom = !fn || !fn.builtin;
   form.querySelectorAll('[data-custom]').forEach((n) => (n.hidden = !custom));
+  form.querySelectorAll('[data-master]').forEach((n) => (n.hidden = fn?.builtin === 'transactions'));
   f.namedItem('command').required = custom;
   f.namedItem('id').value = fn?.id || '';
   $('#fn-form-title').textContent = fn ? `Edit function “${fn.name}”` : 'New function';
@@ -990,7 +1149,68 @@ async function loadAccounts() {
   $('#acct-last').textContent = 'Last balance check: ' + (acctData.lastCheck ? fmt(acctData.lastCheck) : 'never');
   renderBlocked();
   renderAccounts();
+  loadBalanceAlerts();
 }
+
+// --- low-balance alert history / send now / test ---
+const ALERT_TYPES = {
+  low: ['New low balance', 'tag low'], reminder: ['Reminder', 'tag low'], restored: ['Restored', 'tag ok'],
+  manual: ['Sent manually', 'tag blocked'], test: ['Test', 'tag'],
+};
+let balAlerts = { alerts: [], threshold: 0 };
+
+async function loadBalanceAlerts() {
+  try { balAlerts = await api('GET', '/api/balance-alerts'); }
+  catch (e) { return toast('Failed to load low-balance alerts: ' + e.message, true); }
+  $('#balalerts-hint').textContent = `Every alert sent for accounts below the threshold of ${inr(balAlerts.threshold)} (newest first, last 500).`;
+  renderBalanceAlerts();
+}
+
+function renderBalanceAlerts() {
+  const q = $('#balalerts-q').value.trim().toLowerCase();
+  const type = $('#balalerts-type').value;
+  const rows = balAlerts.alerts
+    .filter((a) => !type || a.type === type)
+    .filter((a) => !q || [a.customerName, a.bankName, a.accountNumber, a.accountId].some((v) => String(v || '').toLowerCase().includes(q)));
+  $('#balalerts-count').textContent = balAlerts.alerts.length;
+  const table = $('#balalerts');
+  table.replaceChildren();
+  if (!rows.length) {
+    table.append(el('tr', {}, el('td', { className: 'empty', colSpan: 6, textContent: balAlerts.alerts.length ? 'No alerts match.' : 'No low-balance alerts sent yet.' })));
+    return;
+  }
+  table.append(el('tr', {},
+    el('th', { textContent: 'Sent' }), el('th', { textContent: 'Type' }), el('th', { textContent: 'Customer' }),
+    el('th', { textContent: 'A/c No' }), el('th', { textContent: 'Balance', className: 'num' }), el('th', { textContent: 'Below threshold by', className: 'num' })));
+  for (const a of rows.slice(0, 200)) {
+    const [label, cls] = ALERT_TYPES[a.type] || [a.type, 'tag'];
+    const below = a.threshold - a.balance;
+    table.append(el('tr', {},
+      el('td', { className: 'muted', textContent: fmt(a.at) }),
+      el('td', {}, el('span', { className: cls, textContent: label })),
+      el('td', {}, el('div', { textContent: a.customerName || '—' }), el('span', { className: 'muted', textContent: a.bankName || '' })),
+      el('td', {}, el('code', { textContent: a.accountNumber || a.accountId || '' })),
+      el('td', { className: 'num', textContent: inr(a.balance) }),
+      el('td', { className: 'num muted', textContent: below > 0 ? inr(below) : '—' })));
+  }
+}
+
+$('#balalerts-q').addEventListener('input', renderBalanceAlerts);
+$('#balalerts-type').addEventListener('change', renderBalanceAlerts);
+
+$('#send-low-now').onclick = () => {
+  const b = $('#send-low-now');
+  b.textContent = 'Checking…';
+  run(b, async () => {
+    const r = await api('POST', '/api/balance-alerts/send');
+    toast(r.sent ? `Sent – ${r.sent} account(s) below the threshold` : 'No accounts are below the threshold – nothing sent');
+  }).then(loadAccounts).finally(() => (b.textContent = 'Send low-balance alerts now'));
+};
+
+$('#send-low-test').onclick = () => {
+  const b = $('#send-low-test');
+  run(b, () => api('POST', '/api/balance-alerts/test'), 'Test notification sent – check your alert chats').then(loadBalanceAlerts);
+};
 
 function renderBlocked() {
   const rows = acctData.blocked || [];
