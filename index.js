@@ -20,7 +20,6 @@ logger.init({
   redact: [process.env.TELEGRAM_BOT_TOKEN, process.env.TREXO_KEY, process.env.TREXO_SECRET, process.env.ADMIN_PASSWORD],
 });
 const fs = require('fs');
-const crypto = require('crypto');
 const axios = require('axios');
 const TelegramBot = require('node-telegram-bot-api');
 const { createConfigStore } = require('./config');
@@ -35,10 +34,19 @@ const cfg = {
   allowedUserIds: [],
 
   skipInactive: (process.env.SKIP_INACTIVE_ACCOUNTS || 'true') === 'true',
+  txnLookbackMin: Number(process.env.TXN_LOOKBACK_MINUTES || 30),
 
+  balanceThreshold: Number(process.env.BALANCE_THRESHOLD || 3000000),
+  balanceRemindMin: Number(process.env.BALANCE_REMIND_MINUTES || 60),
+  failThreshold: Number(process.env.FAIL_THRESHOLD || 3),
+  failRepeatEvery: Number(process.env.FAIL_REPEAT_EVERY || 5),
   apiErrorThreshold: Number(process.env.API_ERROR_THRESHOLD || 3),
 
   balancePollSec: Number(process.env.BALANCE_POLL_SECONDS || 300),
+  txnPollSec: Number(process.env.TXN_POLL_SECONDS || 60),
+
+  failedStatuses: new Set(list(process.env.FAILED_STATUSES || 'FAILED,FAILURE,DECLINED,REJECTED,ERROR').map((s) => s.toUpperCase())),
+  successStatuses: new Set(list(process.env.SUCCESS_STATUSES || 'SUCCESS,SUCCESSFUL,COMPLETED,SETTLED').map((s) => s.toUpperCase())),
 
   timezone: process.env.TIMEZONE || 'Asia/Kolkata',
   stateFile: dataFile('STATE_FILE', 'state.json'),
@@ -52,12 +60,6 @@ function writeJson(file, data) {
 
 // Bot token, functions (APIs + keys), auto-clear – editable in the admin panel
 const config = createConfigStore({ file: dataFile('CONFIG_FILE', 'config.json'), env: process.env, writeJson });
-// all project files must come from the same version – stop with a clear message on a partial deploy
-for (const m of ['balanceLevels', 'updateBalanceLevels', 'inbox', 'updateInbox', 'commands', 'updateCommand', 'publicFunctions']) {
-  if (typeof config[m] !== 'function') {
-    throw new Error(`config.js is out of date (missing ${m}) – deploy ALL project files together (index.js, config.js, admin.js, admin.html, logger.js, login.html)`);
-  }
-}
 const refreshSecrets = () => logger.setSecrets([...config.secrets(), process.env.ADMIN_PASSWORD]);
 refreshSecrets();
 
@@ -88,22 +90,15 @@ function mapBalance(r) {
   };
 }
 
-// a field that may be a plain value or an object like { name: "…" }
-const nameOf = (v) => String((v && typeof v === 'object' ? v.name ?? v.title ?? '' : v) ?? '');
-
-// Vendor transaction (sent to the incoming URL)
 function mapTransaction(r) {
   return {
     id: String(r.txn_id ?? r.transaction_id ?? r.transactionId ?? r.id ?? ''),
-    customerId: String(r.customer_id ?? r.customerId ?? r.customer?.id ?? r.account_id ?? ''),
-    customerName: nameOf(r.customer_name ?? r.customerName ?? r.customer),
-    orgName: nameOf(r.organisation_name ?? r.organization_name ?? r.org_name ?? r.organisation ?? r.organization ??
-      r.merchant_name ?? r.business_name ?? r.company_name ?? r.merchant),
+    customerId: String(r.customer_id ?? r.customerId ?? r.account_id ?? ''),
+    customerName: r.customer_name ?? r.customerName ?? '',
     accountId: String(r.account_id ?? r.accountId ?? r.account_number ?? ''),
     amount: Number(r.amount ?? 0),
     status: String(r.status ?? r.txn_status ?? '').toUpperCase(),
-    reason: String(r.failure_reason ?? r.pending_reason ?? r.reason ?? r.status_reason ?? r.error_message ??
-      r.response_message ?? r.status_message ?? r.remarks ?? r.message ?? ''),
+    reason: r.failure_reason ?? r.reason ?? r.error_message ?? r.response_message ?? '',
     time: new Date(r.created_at ?? r.timestamp ?? r.txn_date ?? r.transaction_time ?? Date.now()),
   };
 }
@@ -112,11 +107,14 @@ function mapTransaction(r) {
 // State (persisted so restarts don't re-send alerts)
 // ---------------------------------------------------------------------------
 let state = {
-  incoming: { customers: {}, seen: {} }, // vendor transactions: per-customer recent txns + dedupe keys
+  seenTx: {},        // txnId -> seen timestamp
+  streaks: {},       // customerId -> { count, alerted, customerName, recent[] }
   lowBalance: {},    // accountId -> { since, lastAlert, balance }
   balances: {},      // accountId -> latest snapshot of tracked accounts (for /balance)
   accounts: {},      // accountId -> every account from the APIs, incl. inactive/blocked (for admin panel)
   messages: {},      // chatId -> [{ id, at }] messages the bot can delete when clearing chats
+  lastTxnCheck: null,
+  lastTxnCheckBy: {}, // endpointId -> last successful txn check
   lastBalanceCheck: null,
   lastAutoClear: null,
   lastAutoClearDay: null,
@@ -128,8 +126,6 @@ try {
 } catch (e) {
   console.error('Could not read state file, starting fresh:', e.message);
 }
-// left over from the old transactions-API poller
-for (const k of ['seenTx', 'streaks', 'lastTxnCheck', 'lastTxnCheckBy']) delete state[k];
 
 function saveState() {
   try {
@@ -268,13 +264,11 @@ const accessStore = {
   // every account from the last balance check, flagged for the admin panel
   accounts: () => ({
     lastCheck: state.lastBalanceCheck,
-    threshold: lowLimit(),
-    levels: config.balanceLevels().levels,
+    threshold: cfg.balanceThreshold,
     accounts: Object.values(state.accounts || {}).map((a) => ({
       ...a,
       blocked: isBlocked(a.accountId, a.accountNumber),
-      low: !!levelFor(a.balance),
-      level: levelFor(a.balance),
+      low: a.balance < cfg.balanceThreshold,
     })),
   }),
 };
@@ -393,53 +387,6 @@ async function trackApiHealth(ep, ok, err) {
 // ---------------------------------------------------------------------------
 // Balance monitor
 // ---------------------------------------------------------------------------
-// Low-balance levels (Functions → Balance check): e.g. ≤ ₹30 L 🟢 Low, ≤ ₹20 L 🟡 Low, ≤ ₹10 L 🔴 Very low.
-// Telegram can't colour text, so the colour is shown as an emoji.
-const LEVEL_ICONS = { green: '🟢', yellow: '🟡', red: '🔴' };
-
-// the lowest level the balance has reached (index 0 = highest amount), or null when not low
-function levelFor(balance) {
-  const { levels } = config.balanceLevels();
-  for (let i = levels.length - 1; i >= 0; i--) {
-    if (balance <= levels[i].amount) return { ...levels[i], index: i, icon: LEVEL_ICONS[levels[i].color] };
-  }
-  return null;
-}
-
-// top of the low range (e.g. ₹30 L) – anything above is OK
-const lowLimit = () => config.balanceLevels().levels[0].amount;
-
-const levelsLine = () => config.balanceLevels().levels
-  .map((l) => `${LEVEL_ICONS[l.color]} ${esc(l.label)} ≤ ${lakh(l.amount)}`).join(' · ');
-
-function lowBalanceText(a, lvl, prev, changed, test) {
-  const levels = config.balanceLevels().levels;
-  const prevLvl = prev?.level !== undefined ? levels[prev.level] : null;
-  let note = '';
-  if (changed && prevLvl) {
-    note = lvl.index > prev.level
-      ? `↘ dropped from ${LEVEL_ICONS[prevLvl.color]} ${esc(prevLvl.label)} (≤ ${lakh(prevLvl.amount)})\n`
-      : `↗ improved from ${LEVEL_ICONS[prevLvl.color]} ${esc(prevLvl.label)} (≤ ${lakh(prevLvl.amount)})\n`;
-  }
-  return `${lvl.icon} <b>${esc(lvl.label.toUpperCase())} BALANCE</b> – at or below ${lakh(lvl.amount)}` +
-    `${!changed ? ' (reminder)' : ''}${test ? ' (test)' : ''}\n` + note +
-    acctLines(a) +
-    `Balance: <b>${inr(a.balance)}</b> (${lakh(a.balance)})\n` +
-    (a.disputeAmount > 0 ? `Dispute amount: ${inr(a.disputeAmount)}\n` : '') +
-    (prev?.since && !changed ? `Low since: ${fmtTime(prev.since)}\n` : '') +
-    `<i>Levels: ${levelsLine()}</i>`;
-}
-
-// one sample alert per level, from the admin panel
-async function sendBalanceTest() {
-  const { levels } = config.balanceLevels();
-  for (let i = 0; i < levels.length; i++) {
-    const balance = Math.round(levels[i].amount * 0.95);
-    const a = { customerName: 'Test Customer', bankName: 'Test Bank', ifsc: 'TEST0001234', accountNumber: 'XXXXXX7854', balance, disputeAmount: 0 };
-    await notify(lowBalanceText(a, { ...levels[i], index: i, icon: LEVEL_ICONS[levels[i].color] }, null, true, true));
-  }
-}
-
 async function fetchAccountsFrom(ep) {
   const res = await apiGet(ep);
   return extractList(res.data).map(mapBalance)
@@ -466,7 +413,7 @@ async function checkBalances() {
   if (failedSources.size === results.length) { saveState(); return; }
 
   const now = Date.now();
-  const remindMs = (config.balanceLevels().remindMin || 0) * 60000;
+  const remindMs = cfg.balanceRemindMin * 60000;
   // keep last known data for APIs that failed this round, so their alerts don't reset
   const keepFailed = (obj) => Object.fromEntries(Object.entries(obj || {}).filter(([, a]) => failedSources.has(a.source)));
   state.accounts = keepFailed(state.accounts);
@@ -485,14 +432,19 @@ async function checkBalances() {
   for (const a of accounts) {
     state.balances[a.accountId] = { ...a, checkedAt: now };
     const low = state.lowBalance[a.accountId];
-    const lvl = levelFor(a.balance);
 
-    if (lvl) {
-      // alert when the account enters a level or moves to another one, plus reminders
-      const changed = !low || low.level !== lvl.index;
-      if (changed || (remindMs > 0 && now - low.lastAlert >= remindMs)) {
-        await notify(lowBalanceText(a, lvl, low, changed));
-        state.lowBalance[a.accountId] = { since: low?.since || now, lastAlert: now, balance: a.balance, level: lvl.index };
+    if (a.balance < cfg.balanceThreshold) {
+      const isNew = !low;
+      if (isNew || (remindMs > 0 && now - low.lastAlert >= remindMs)) {
+        await notify(
+          `${isNew ? '⚠️' : '🔁'} <b>Low Balance${isNew ? '' : ' (reminder)'}</b>\n` +
+          acctLines(a) +
+          `Balance: <b>${inr(a.balance)}</b> (${lakh(a.balance)})\n` +
+          (a.disputeAmount > 0 ? `Dispute amount: ${inr(a.disputeAmount)}\n` : '') +
+          `Threshold: ${inr(cfg.balanceThreshold)} (${lakh(cfg.balanceThreshold)})` +
+          (isNew ? '' : `\nLow since: ${fmtTime(low.since)}`)
+        );
+        state.lowBalance[a.accountId] = { since: isNew ? now : low.since, lastAlert: now, balance: a.balance };
       } else {
         low.balance = a.balance;
       }
@@ -514,227 +466,90 @@ async function checkBalances() {
 }
 
 // ---------------------------------------------------------------------------
-// Transaction failures – the vendor POSTs failed / pending (and successful)
-// transactions to /incoming/<token>. When a customer has N failed or N pending
-// transactions in a row, one alert lists all N with IDs and reasons.
+// Transaction failure monitor
 // ---------------------------------------------------------------------------
-const deliveries = []; // recent vendor deliveries, memory only (they contain customer data)
-
-function logDelivery(entry) {
-  deliveries.unshift({ at: Date.now(), txns: [], ...entry });
-  deliveries.length = Math.min(deliveries.length, 25);
-  return deliveries[0];
-}
-
-function parseIncomingBody(raw, contentType) {
-  const body = raw.toString('utf8');
-  if (/x-www-form-urlencoded/i.test(contentType || '')) {
-    const obj = Object.fromEntries(new URLSearchParams(body));
-    for (const k of ['payload', 'data', 'body']) {
-      if (typeof obj[k] === 'string') { try { return JSON.parse(obj[k]); } catch { /* not JSON */ } }
-    }
-    return obj;
-  }
-  return JSON.parse(body);
-}
-
-// the transaction record(s) in a delivery: {…}, [{…}], {data:{…}}, {data:[…]}, {event, transaction:{…}} …
-function incomingRecords(p, depth = 0) {
-  if (Array.isArray(p)) return p.filter((r) => r && typeof r === 'object');
-  if (!p || typeof p !== 'object') return [];
-  if (depth < 3) {
-    for (const k of ['data', 'transaction', 'txn', 'payload', 'object', 'payment']) {
-      const v = p[k];
-      if (Array.isArray(v) || (v && typeof v === 'object')) return incomingRecords(v, depth + 1);
-    }
-  }
-  return [p];
-}
-
-// status from the event name when the record has none, e.g. "payment.failed" → FAILED
-const eventStatus = (payload) =>
-  String(payload?.status ?? payload?.event ?? payload?.type ?? '').split(/[._:\s]/).pop().toUpperCase();
-
-function statusKind(inbox, status) {
-  const has = (k) => list(inbox.statuses?.[k]).includes(status);
-  return has('failed') ? 'failed' : has('success') ? 'success' : has('pending') ? 'pending' : null;
-}
-
-const STREAK_WORDS = { failed: ['🚨', 'failed'], pending: ['⏳', 'pending'] };
-const customerKey = (t) => t.customerId || t.customerName || t.orgName || t.accountId || 'unknown';
-
-function customerLines(c) {
-  return `Customer: <b>${esc(c.name || '-')}</b>${c.customerId ? ` (<code>${esc(c.customerId)}</code>)` : ''}\n` +
-    `Organisation: <b>${esc(c.org || '-')}</b>\n` +
-    (c.accountId ? `A/c: <code>${esc(c.accountId)}</code>\n` : '');
-}
-
-function streakAlertText(c, kind, count, limit, test) {
-  const [icon, word] = STREAK_WORDS[kind];
-  const rows = c.txns.slice(-limit).map((x, i) =>
-    `${i + 1}. <code>${esc(x.id)}</code> · ${inr(x.amount)} · ${fmtTime(x.time)}` +
-    (kind === 'pending' ? ` · ${esc(x.status)}` : '') +
-    (x.org && x.org !== c.org ? ` · ${esc(x.org)}` : '') +
-    `\n    Reason: ${esc(x.reason || 'not given')}`
+function failAlertText(customerId, s) {
+  const rows = s.recent.map((r) =>
+    `• ${fmtTime(r.time)} | A/c <code>${esc(r.accountId || '-')}</code> | ${inr(r.amount)}${r.reason ? ` | ${esc(r.reason)}` : ''}`
   ).join('\n');
-  return `${icon} <b>${count} ${word} transactions in a row</b>${test ? ' (test)' : ''}\n` +
-    customerLines(c) +
-    `\n<b>${count > limit ? `Last ${limit}` : `All ${limit}`} ${word} transactions:</b>\n${rows}`;
+  return (
+    `🚨 <b>Consecutive Transaction Failures</b>\n` +
+    `Customer: ${custLabel(s.customerName, customerId)}\n` +
+    `Failed in a row: <b>${s.count}</b>\n\n` +
+    `<b>Recent failures:</b>\n${rows}`
+  );
 }
 
-function streakEndedText(c, kind, latest) {
-  return `✅ <b>${kind === 'failed' ? 'Failures stopped' : 'Pending cleared'}</b>\n` + customerLines(c) +
-    `Latest txn <code>${esc(latest.id)}</code> is ${esc(latest.status)} · ${inr(latest.amount)} · ${fmtTime(latest.time)}`;
+function txnParams(ep, now) {
+  if (!ep.sinceParam) return {};
+  const base = state.lastTxnCheckBy?.[ep.id] || state.lastTxnCheck || now - cfg.txnLookbackMin * 60000;
+  return { [ep.sinceParam]: new Date(base - 5 * 60000).toISOString() }; // 5 min overlap, deduped below
 }
 
-// trailing run of one kind at the end of a customer's transaction list
-function trailing(c, kind) {
-  let n = 0;
-  for (let j = c.txns.length - 1; j >= 0 && c.txns[j].kind === kind; j--) n++;
-  return n;
-}
+async function checkTransactions() {
+  const eps = endpointsOf('transactions');
+  if (!eps.length) return;
 
-async function recordIncoming(inbox, t, kind, summary) {
-  state.incoming ||= { customers: {}, seen: {} };
-  const customers = state.incoming.customers;
-  const c = (customers[customerKey(t)] ||= { txns: [], alerted: {} });
-  if (t.customerName) c.name = t.customerName;
-  if (t.orgName) c.org = t.orgName;
-  if (t.customerId) c.customerId = t.customerId;
-  if (t.accountId) c.accountId = t.accountId;
-  c.updatedAt = Date.now();
-
-  // one entry per transaction in arrival order; a later update (pending → failed) changes it in place
-  const rec = { id: t.id, kind, status: t.status, amount: t.amount, reason: t.reason, time: t.time.toISOString(), org: t.orgName };
-  const i = c.txns.findIndex((x) => x.id === t.id);
-  if (i >= 0) c.txns[i] = { ...c.txns[i], ...rec, reason: t.reason || c.txns[i].reason };
-  else c.txns.push(rec);
-  c.txns = c.txns.slice(-50);
-
-  const parts = [];
-  for (const k of ['failed', 'pending']) {
-    const limit = Number(k === 'failed' ? inbox.failedInRow : inbox.pendingInRow) || 0;
-    if (!limit) continue;
-    const n = trailing(c, k);
-    if (n) parts.push(`${k} ${n}/${limit}`);
-    if (n >= limit) {
-      // alert at N in a row, then again at 2N, 3N …
-      if (!c.alerted[k] || (n !== c.alerted[k] && (n - limit) % limit === 0)) {
-        await notify(streakAlertText(c, k, n, limit));
-        c.alerted[k] = n;
-        summary.notified = true;
-        parts.push('alert sent');
-      }
-    } else if (c.alerted[k]) {
-      await notify(streakEndedText(c, k, c.txns.at(-1)));
-      c.alerted[k] = 0;
-      parts.push(`${k} streak ended`);
+  const startedAt = Date.now();
+  state.lastTxnCheckBy ||= {};
+  const txns = [];
+  for (const ep of eps) {
+    try {
+      const res = await apiGet(ep, txnParams(ep, startedAt));
+      txns.push(...extractList(res.data).map(mapTransaction).filter((t) => t.id && t.customerId));
+      state.lastTxnCheckBy[ep.id] = startedAt;
+      await trackApiHealth(ep, true);
+    } catch (e) {
+      await trackApiHealth(ep, false, e);
     }
   }
-  if (parts.length) summary.streak = parts.join(' · ');
-}
+  txns.sort((a, b) => a.time - b.time);
 
-// customers idle for 7 days and dedupe keys older than 2 days are forgotten
-function forgetOldIncoming() {
-  const inc = state.incoming;
-  if (!inc) return;
-  const now = Date.now();
-  for (const [k, ts] of Object.entries(inc.seen)) if (ts < now - 2 * 86400e3) delete inc.seen[k];
-  for (const [k, c] of Object.entries(inc.customers)) if ((c.updatedAt || 0) < now - 7 * 86400e3) delete inc.customers[k];
-  const keys = Object.keys(inc.customers);
-  if (keys.length > 5000) {
-    keys.sort((a, b) => inc.customers[a].updatedAt - inc.customers[b].updatedAt);
-    for (const k of keys.slice(0, keys.length - 5000)) delete inc.customers[k];
+  for (const t of txns) {
+    if (state.seenTx[t.id]) continue;
+    const isFail = cfg.failedStatuses.has(t.status);
+    const isOk = cfg.successStatuses.has(t.status);
+    if (!isFail && !isOk) continue; // pending/processing: check again next cycle
+
+    state.seenTx[t.id] = Date.now();
+    if (isBlocked(t.accountId, t.customerId)) {
+      delete state.streaks[t.customerId];
+      continue; // blocked account: no failure alerts
+    }
+    const s = (state.streaks[t.customerId] ||= { count: 0, alerted: false, customerName: '', recent: [] });
+    if (t.customerName) s.customerName = t.customerName;
+
+    if (isFail) {
+      s.count += 1;
+      s.recent.push({ id: t.id, accountId: t.accountId, amount: t.amount, reason: t.reason, time: t.time.toISOString() });
+      s.recent = s.recent.slice(-5);
+
+      const over = s.count - cfg.failThreshold;
+      const shouldAlert = s.count >= cfg.failThreshold &&
+        (!s.alerted || (cfg.failRepeatEvery > 0 && over % cfg.failRepeatEvery === 0));
+      if (shouldAlert) {
+        await notify(failAlertText(t.customerId, s));
+        s.alerted = true;
+      }
+    } else {
+      if (s.alerted) {
+        await notify(
+          `✅ <b>Transactions Recovered</b>\n` +
+          `Customer: ${custLabel(s.customerName, t.customerId)}\n` +
+          `Successful txn after <b>${s.count}</b> failures.\n` +
+          `Txn: <code>${esc(t.id)}</code> | ${inr(t.amount)} | ${fmtTime(t.time)}`
+        );
+      }
+      delete state.streaks[t.customerId];
+    }
   }
-}
 
-async function handleIncoming(inbox, payload, records, entry) {
-  for (const r of records) {
-    const t = mapTransaction(r);
-    if (!t.status) t.status = eventStatus(payload);
-    const kind = statusKind(inbox, t.status);
-    const summary = { id: t.id, status: t.status, kind: kind || 'ignored' };
-    entry.txns.push(summary);
+  // forget processed txn IDs older than 2 days
+  const cutoff = Date.now() - 2 * 24 * 3600 * 1000;
+  for (const [id, ts] of Object.entries(state.seenTx)) if (ts < cutoff) delete state.seenTx[id];
 
-    if (!t.id) { summary.note = 'no transaction ID found'; continue; }
-    if (!kind) { summary.note = 'status not in any list'; continue; }
-    if (isBlocked(t.accountId, t.customerId)) { summary.note = 'blocked account'; continue; }
-
-    // vendors retry deliveries – count each transaction + status once
-    state.incoming ||= { customers: {}, seen: {} };
-    const key = `${t.id}:${t.status}`;
-    if (state.incoming.seen[key]) { summary.note = 'duplicate'; continue; }
-    state.incoming.seen[key] = Date.now();
-
-    await recordIncoming(inbox, t, kind, summary);
-  }
-  forgetOldIncoming();
+  if (Object.values(state.lastTxnCheckBy).includes(startedAt)) state.lastTxnCheck = startedAt;
   saveState();
-  console.log('[INCOMING] ' + (entry.txns.map((s) =>
-    `${s.id || '?'} ${s.status || '?'}${s.streak ? ` [${s.streak}]` : ''}${s.note ? ` (${s.note})` : ''}`).join(', ') || 'no transactions'));
-}
-
-// deliveries are processed one at a time, in arrival order, so the counts stay right
-let incomingQueue = Promise.resolve();
-
-// called by the admin server for POST /incoming/:token
-function receiveIncoming(token, rawBody, contentType) {
-  const fn = config.fn('transactions');
-  const inbox = config.inbox();
-  const a = Buffer.from(String(token || ''));
-  const b = Buffer.from(inbox.token);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { status: 404, body: { error: 'Not found' } };
-
-  const preview = rawBody.toString('utf8').slice(0, 4000);
-  // function switched off → accept (so the vendor doesn't keep retrying) but do nothing
-  if (!fn.enabled) {
-    logDelivery({ httpStatus: 200, note: 'Ignored – Transaction failures is switched off', body: preview });
-    return { status: 200, body: { ok: true, ignored: 'disabled' } };
-  }
-
-  let payload;
-  try {
-    payload = parseIncomingBody(rawBody, contentType);
-  } catch {
-    logDelivery({ httpStatus: 400, note: 'Body is not valid JSON', body: preview });
-    return { status: 400, body: { error: 'Invalid JSON' } };
-  }
-
-  const records = incomingRecords(payload);
-  const entry = logDelivery({ httpStatus: 200, note: records.length ? '' : 'No transaction in payload', body: preview });
-  incomingQueue = incomingQueue
-    .then(() => handleIncoming(inbox, payload, records, entry))
-    .catch((e) => console.error('[INCOMING] failed:', e.message));
-  return { status: 200, body: { ok: true, received: records.length } };
-}
-
-// sample "N in a row" alert from the admin panel
-async function sendIncomingTest(kind) {
-  if (!STREAK_WORDS[kind]) throw new Error('Unknown type');
-  const inbox = config.inbox();
-  const limit = Number(kind === 'failed' ? inbox.failedInRow : inbox.pendingInRow) || 5;
-  const reasons = kind === 'failed'
-    ? ['Insufficient funds', 'Bank server down', 'Invalid account number', 'Limit exceeded', 'Timeout from bank']
-    : ['Awaiting bank confirmation', 'In bank queue', 'Beneficiary bank slow', 'Processing', 'Awaiting UTR'];
-  const c = {
-    name: 'Test Customer', customerId: 'CUST-TEST', org: 'Test Organisation Pvt Ltd', accountId: 'XXXX1234',
-    txns: Array.from({ length: limit }, (_, i) => ({
-      id: `TEST-${Date.now()}-${i + 1}`, kind, status: list(inbox.statuses[kind])[0] || kind.toUpperCase(),
-      amount: 1000 * (i + 1), reason: reasons[i % reasons.length], time: new Date(Date.now() - (limit - i) * 60000).toISOString(),
-    })),
-  };
-  await notify(streakAlertText(c, kind, limit, limit, true));
-  logDelivery({ httpStatus: 200, note: `Test “${limit} ${kind} in a row” alert sent from the admin panel` });
-}
-
-// current streaks, for /failures and the admin panel
-function currentStreaks() {
-  const inbox = config.inbox();
-  return Object.values(state.incoming?.customers || {})
-    .map((c) => ({ c, failed: trailing(c, 'failed'), pending: trailing(c, 'pending') }))
-    .filter((s) => s.failed || s.pending)
-    .map((s) => ({ ...s, limitFailed: inbox.failedInRow, limitPending: inbox.pendingInRow }))
-    .sort((a, b) => (b.failed + b.pending) - (a.failed + a.pending));
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,7 +869,7 @@ async function balanceLookup(msg, q) {
   if (found.length > 15) return send(msg.chat.id, `${found.length} accounts match "<b>${esc(q)}</b>" – please be more specific.`);
 
   const text = found.map((a) =>
-    `${levelFor(a.balance)?.icon || '✅'} <b>${esc(a.customerName || '-')}</b>${a.isActive ? '' : ' <i>(inactive)</i>'}${isBlocked(a.accountId, a.accountNumber) ? ' <i>(blocked – no alerts)</i>' : ''}\n` +
+    `${a.balance < cfg.balanceThreshold ? '🔴' : '🟢'} <b>${esc(a.customerName || '-')}</b>${a.isActive ? '' : ' <i>(inactive)</i>'}${isBlocked(a.accountId, a.accountNumber) ? ' <i>(blocked – no alerts)</i>' : ''}\n` +
     `Bank: ${esc(a.bankName || '-')}${a.ifsc ? ` (${esc(a.ifsc)})` : ''}\n` +
     `A/c No: <code>${esc(a.accountNumber)}</code>\n` +
     `Balance: <b>${inr(a.balance)}</b> (${lakh(a.balance)})` +
@@ -1068,31 +883,27 @@ const COMMAND_HANDLERS = {
   help: (msg) => send(msg.chat.id, helpText()),
 
   status: (msg) => {
-    const inbox = config.inbox();
-    const streaks = currentStreaks();
     const apis = config.get().functions.map((f) => {
-      const head = `${f.enabled ? '🟢' : '⚪️'} ${esc(f.name)}${f.builtin ? '' : ` (/${f.command})`}`;
-      if (f.builtin === 'transactions') {
-        return `${head}\n   • receives vendor transactions · alerts at ${inbox.failedInRow || 'off'} failed / ${inbox.pendingInRow || 'off'} pending in a row` +
-          (deliveries[0] ? `\n   • last delivery ${fmtTime(deliveries[0].at)}` : '');
-      }
       const rows = f.apis.map((a) => {
         const errs = state.apiErrors[f.builtin ? a.id : `${f.id}:${a.id}`];
         return `   • ${esc(a.name)}${a.enabled ? '' : ' – disabled'}${errs ? ` – ${errs} error(s)` : ''}`;
       });
       const alerts = Object.keys(state.fnAlerts || {}).filter((k) => k.startsWith(f.id + ':')).length;
-      return `${head}${alerts ? ` – ${alerts} alert(s) active` : ''}\n` + (rows.join('\n') || '   • no APIs');
+      return `${f.enabled ? '🟢' : '⚪️'} ${esc(f.name)}${f.builtin ? '' : ` (/${f.command})`}${alerts ? ` – ${alerts} alert(s) active` : ''}\n` +
+        (rows.join('\n') || '   • no APIs');
     }).join('\n');
     const ac = config.get().autoClear;
     return send(msg.chat.id,
       `<b>Status</b>\n` +
-      `Last balance check: ${state.lastBalanceCheck ? fmtTime(state.lastBalanceCheck) : 'never'}\n\n` +
+      `Last balance check: ${state.lastBalanceCheck ? fmtTime(state.lastBalanceCheck) : 'never'}\n` +
+      `Last txn check: ${state.lastTxnCheck ? fmtTime(state.lastTxnCheck) : 'never'}\n\n` +
       `<b>Functions</b>\n${apis}\n\n` +
-      `Low-balance levels: ${levelsLine()}\n` +
+      `Balance threshold: ${inr(cfg.balanceThreshold)} (${lakh(cfg.balanceThreshold)})\n` +
+      `Failure alert after: ${cfg.failThreshold} consecutive fails\n` +
       `Accounts tracked: ${Object.keys(state.balances).length}\n` +
       `Blocked accounts: ${access.blockedAccounts.length} · Inactive accounts: ${cfg.skipInactive ? 'skipped' : 'checked'}\n` +
       `Low balance now: ${Object.keys(state.lowBalance).length}\n` +
-      `Customers with failed in a row: ${streaks.filter((s) => s.failed).length} · pending in a row: ${streaks.filter((s) => s.pending).length}\n` +
+      `Active failure streaks: ${Object.values(state.streaks).filter((s) => s.count > 0).length}\n` +
       `Chat auto-clear: ${ac.enabled ? (ac.mode === 'daily' ? `daily at ${ac.time}` : 'continuous') + `, older than ${ac.olderThanHours}h` : 'off'}`
     );
   },
@@ -1111,42 +922,35 @@ const COMMAND_HANDLERS = {
     const rows = Object.values(state.balances).sort((a, b) => a.balance - b.balance);
     if (!rows.length) return send(msg.chat.id, 'No balance data yet.');
     const text = rows.map((a) =>
-      `${levelFor(a.balance)?.icon || '✅'} <b>${esc(a.customerName || '-')}</b> | ${esc(a.bankName || '-')} | <code>${esc(a.accountNumber)}</code> | ${inr(a.balance)}`
+      `${a.balance < cfg.balanceThreshold ? '🔴' : '🟢'} <b>${esc(a.customerName || '-')}</b> | ${esc(a.bankName || '-')} | <code>${esc(a.accountNumber)}</code> | ${inr(a.balance)}`
     ).join('\n');
     return send(msg.chat.id, `<b>Balances</b> (lowest first)\n\n${text}`);
   },
 
   low: (msg) => {
-    const rows = Object.entries(state.lowBalance).sort((x, y) => x[1].balance - y[1].balance);
-    if (!rows.length) return send(msg.chat.id, `✅ All accounts above ${lakh(lowLimit())}.`);
+    const rows = Object.entries(state.lowBalance);
+    if (!rows.length) return send(msg.chat.id, '✅ All accounts above threshold.');
     const text = rows.map(([id, l]) => {
       const a = state.balances[id] || {};
-      const lvl = levelFor(l.balance);
-      return `${lvl?.icon || '🔴'} <b>${esc(a.customerName || '-')}</b> | ${esc(a.bankName || '-')} | <code>${esc(a.accountNumber || id)}</code> | ${inr(l.balance)}${lvl ? ` | ${esc(lvl.label)}` : ''} | since ${fmtTime(l.since)}`;
+      return `🔴 <b>${esc(a.customerName || '-')}</b> | ${esc(a.bankName || '-')} | <code>${esc(a.accountNumber || id)}</code> | ${inr(l.balance)} | since ${fmtTime(l.since)}`;
     }).join('\n');
-    return send(msg.chat.id, `<b>Low Balance Accounts</b> (lowest first)\n<i>${levelsLine()}</i>\n\n${text}`);
+    return send(msg.chat.id, `<b>Low Balance Accounts</b>\n\n${text}`);
   },
 
-  // customers whose latest transactions are failed / pending in a row
   failures: (msg) => {
-    const rows = currentStreaks();
-    if (!rows.length) return send(msg.chat.id, '✅ No customers with failed or pending transactions in a row.');
-    const text = rows.slice(0, 50).map(({ c, failed, pending, limitFailed, limitPending }) => {
-      const kind = failed ? 'failed' : 'pending';
-      const n = failed || pending;
-      const limit = failed ? limitFailed : limitPending;
-      const last = c.txns.at(-1);
-      return `${failed ? (limit && n >= limit ? '🚨' : '⚠️') : '⏳'} <b>${esc(c.name || c.customerId || '-')}</b>` +
-        (c.org ? ` · ${esc(c.org)}` : '') + ` – ${n} ${kind} in a row` +
-        (last?.reason ? `\n    last: <code>${esc(last.id)}</code> ${esc(last.reason)}` : '');
-    }).join('\n');
-    return send(msg.chat.id, `<b>Failed / pending in a row</b>\n\n${text}`);
+    const rows = Object.entries(state.streaks).filter(([, s]) => s.count > 0).sort((a, b) => b[1].count - a[1].count);
+    if (!rows.length) return send(msg.chat.id, '✅ No active failure streaks.');
+    const text = rows.map(([id, s]) =>
+      `${s.count >= cfg.failThreshold ? '🚨' : '⚠️'} ${custLabel(s.customerName, id)} – ${s.count} in a row` +
+      (s.recent.at(-1)?.reason ? ` (last: ${esc(s.recent.at(-1).reason)})` : '')
+    ).join('\n');
+    return send(msg.chat.id, `<b>Failure Streaks</b>\n\n${text}`);
   },
 
   check: async (msg) => {
-    await send(msg.chat.id, '⏳ Running balance check...');
-    await checkBalances();
-    await send(msg.chat.id, `✅ Check complete. Use ${cmd('status')} for details.`);
+    await send(msg.chat.id, '⏳ Running checks...');
+    await Promise.all([checkBalances(), checkTransactions()]);
+    await send(msg.chat.id, `✅ Checks complete. Use ${cmd('status')} for details.`);
   },
 
   clear: async (msg) => {
@@ -1226,8 +1030,10 @@ startBot(config.get().telegram.botToken).catch((e) =>
   console.error('Could not start Telegram bot:', e.response?.body?.description || e.message, '– check the token in the admin panel'));
 
 if (!endpointsOf('balance').length) console.warn('⚠ No balance API configured – add one in the admin panel (Functions tab)');
+if (!endpointsOf('transactions').length) console.warn('⚠ No transactions API configured – add one in the admin panel (Functions tab)');
 
 schedule('balance', checkBalances, cfg.balancePollSec);
+schedule('transactions', checkTransactions, cfg.txnPollSec);
 setInterval(functionsTick, 20 * 1000);
 setInterval(() => autoClearTick().catch((e) => console.error('Auto-clear failed:', e.message)), 30 * 1000);
 
@@ -1262,28 +1068,6 @@ require('./admin').startAdmin({
     setBotToken: changeBotToken,
   },
 
-  // Balance check: low-balance levels
-  balanceLevels: {
-    update: (data) => config.updateBalanceLevels(data),
-    test: sendBalanceTest,
-  },
-
-  // Transaction failures: vendor → incoming URL
-  incoming: {
-    receive: receiveIncoming,
-    view: () => ({
-      inbox: config.inbox(),
-      defaults: config.defaultInboxStatuses(),
-      deliveries,
-      streaks: currentStreaks().slice(0, 100).map(({ c, failed, pending }) => ({
-        name: c.name, customerId: c.customerId, org: c.org, failed, pending, last: c.txns.at(-1),
-      })),
-    }),
-    update: (data) => config.updateInbox(data),
-    regenerate: () => { const i = config.regenerateInboxToken(); refreshSecrets(); return i; },
-    test: sendIncomingTest,
-  },
-
   commands: {
     view: () => ({
       commands: config.commands(),
@@ -1307,7 +1091,7 @@ require('./admin').startAdmin({
       const api = fn?.apis.find((a) => a.id === apiId);
       if (!api) throw new Error('API not found');
       const started = Date.now();
-      const params = fn.builtin ? undefined : customParams(api);
+      const params = fn.builtin === 'transactions' ? txnParams(api, started) : fn.builtin ? undefined : customParams(api);
       const res = await apiRequest(fn, api, params);
       const items = extractList(res.data);
       const sample = items[0] || (res.data && typeof res.data === 'object' ? res.data : {});
