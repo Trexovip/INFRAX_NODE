@@ -97,7 +97,7 @@ async function lookupLabel(bot, id) {
   }
 }
 
-function startAdmin({ port, host, user, password, trustProxy, getBot, access, runBalanceCheck, sendTest, chats, settings, commands, functions, incoming }) {
+function startAdmin({ port, host, user, password, trustProxy, getBot, access, runBalanceCheck, sendTest, chats, settings, commands, functions, incoming, balanceLevels }) {
   if (!password) {
     console.warn('ADMIN_PASSWORD not set – admin panel disabled');
     return null;
@@ -281,6 +281,21 @@ function startAdmin({ port, host, user, password, trustProxy, getBot, access, ru
           console.log(`[ADMIN] ${session.user} changed the Telegram bot token (now @${info?.username})`);
           return json(res, 200, { ok: true, bot: info });
         }
+      }
+
+      // --- Balance check: low-balance levels ---
+      // POST /api/balance-levels  { levels: [{ amount, label } ×3], remindMin }
+      if (req.method === 'POST' && parts[1] === 'balance-levels' && parts.length === 2) {
+        const r = balanceLevels.update(await readBody(req));
+        console.log(`[ADMIN] ${session.user} set low-balance levels: ${r.levels.map((l) => `${l.label} ≤ ${l.amount}`).join(', ')} · remind every ${r.remindMin} min`);
+        return json(res, 200, { ok: true });
+      }
+
+      // POST /api/balance-levels/test  – one sample alert per level
+      if (req.method === 'POST' && parts[1] === 'balance-levels' && parts[2] === 'test' && parts.length === 3) {
+        await balanceLevels.test();
+        console.log(`[ADMIN] ${session.user} sent test low-balance alerts`);
+        return json(res, 200, { ok: true });
       }
 
       // --- Transaction failures: incoming URL settings ---
