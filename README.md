@@ -60,7 +60,7 @@ TIMEZONE=Asia/Kolkata                     # used for daily auto-clear time and m
 **Functions tab**
 A function is a set of APIs with its own **master key**. Each API uses the function's master key, its own separate key, or no key. Key header names are configurable (default `x-trexo-key` / `x-trexo-secret`). Keys are only ever shown masked; leave key fields blank when editing to keep them.
 
-- **Balance check** (built-in) – its APIs feed low-balance alerts and `/bal`, `/balance`, `/low`. Add several and the accounts are combined.
+- **Balance check** (built-in) – its APIs feed low-balance alerts and `/bal`, `/balance`, `/low`. Add several and the accounts are combined. **Low-balance levels** (in the card): 🟢 *Low* at or below ₹30 L, 🟡 *Low* at or below ₹20 L, 🔴 *Very low* at or below ₹10 L – amounts and labels are editable. An alert is sent when an account reaches a level and every time it moves to another level (down or back up), with reminders every N minutes while it stays put and “Balance restored” above the first level. **Send test alerts** posts one sample per level.
 - **Transaction failures** (built-in) – no API: your vendor **sends** every failed and pending transaction to the function's **Incoming URL** (`https://<your-domain>/incoming/<random>` – shown in the card with a Copy button; no secret needed, keep it private; **New URL** replaces it). When a customer has **5 failed in a row** (configurable, 0 = off) one alert lists the customer name, organisation and all 5 transactions with ID, amount, time and failure reason; the same for **5 pending in a row** with the pending reasons. Repeats at 10, 15 …; a “Failures stopped” / “Pending cleared” message follows when the customer's latest transaction is no longer failed / pending. Vendor retries are counted once, blocked accounts are skipped, and switching the function off makes the URL accept but ignore deliveries. The card also shows the customers currently in a row, the last 25 deliveries with their raw payload, and **Test** buttons. `/failures` lists the current streaks.
   - Fields read from each transaction: ID (`txn_id` / `transaction_id` / `id`), customer (`customer_id`, `customer_name`), organisation (`organisation_name` / `organization_name` / `org_name` / `merchant_name` …), amount, status (`status` / `txn_status`, or the event name like `payment.failed`), reason (`failure_reason` / `pending_reason` / `reason` / `status_message` / `remarks` …). The body may be the transaction itself, a list, or wrapped in `data` / `transaction` / `payload`.
 - **Custom functions** – click **+ New function**:
@@ -98,6 +98,6 @@ Edit `mapBalance()` (balance API) and `mapTransaction()` (vendor transactions) i
 - 🚨 Customer has N failed transactions in a row (vendor → Incoming URL; N set in the panel, default 5)
 - ⏳ Customer has N pending transactions in a row
 - ✅ Failures stopped / pending cleared when the customer's latest transaction changes
-- ⚠️ Account balance below BALANCE_THRESHOLD (reminder every BALANCE_REMIND_MINUTES)
+- 🟢 / 🟡 / 🔴 Account balance at or below ₹30 L / ₹20 L / ₹10 L (levels and reminder interval set in the panel)
 - ✅ Balance restored
 - 🔴 API not responding (per API)
