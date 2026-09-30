@@ -40,6 +40,21 @@ function redirect(res, to) {
   res.end();
 }
 
+// raw request body (vendor deliveries may be JSON or form-encoded)
+function readRawBody(req, limit = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) { reject(new Error('Body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
@@ -82,7 +97,7 @@ async function lookupLabel(bot, id) {
   }
 }
 
-function startAdmin({ port, host, user, password, trustProxy, getBot, access, runBalanceCheck, sendTest, chats, settings, commands, functions }) {
+function startAdmin({ port, host, user, password, trustProxy, getBot, access, runBalanceCheck, sendTest, chats, settings, commands, functions, incoming, balanceAlerts }) {
   if (!password) {
     console.warn('ADMIN_PASSWORD not set – admin panel disabled');
     return null;
@@ -125,6 +140,14 @@ function startAdmin({ port, host, user, password, trustProxy, getBot, access, ru
       const url = new URL(req.url, 'http://local');
       const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
       const session = getSession(req);
+
+      // --- callback URL: vendor → Transaction failures (public; the random token in the URL is the only check) ---
+      // POST /callback/:token
+      if (parts[0] === 'callback' && parts.length === 2) {
+        if (req.method !== 'POST') return json(res, 405, { error: 'Use POST' });
+        const r = incoming.receive(parts[1], await readRawBody(req), req.headers['content-type']);
+        return json(res, r.status, r.body);
+      }
 
       // Writes require a JSON content type – blocks simple cross-site form posts
       if (req.method !== 'GET' && !String(req.headers['content-type'] || '').startsWith('application/json')) {
@@ -257,6 +280,54 @@ function startAdmin({ port, host, user, password, trustProxy, getBot, access, ru
           const info = await settings.setBotToken(token);
           console.log(`[ADMIN] ${session.user} changed the Telegram bot token (now @${info?.username})`);
           return json(res, 200, { ok: true, bot: info });
+        }
+      }
+
+      // --- Transaction failures: callback URL settings ---
+      if (parts[1] === 'incoming') {
+        // GET /api/incoming
+        if (req.method === 'GET' && parts.length === 2) return json(res, 200, incoming.view());
+
+        // POST /api/incoming  { failedInRow, pendingInRow, statuses }
+        if (req.method === 'POST' && parts.length === 2) {
+          const i = incoming.update(await readBody(req));
+          console.log(`[ADMIN] ${session.user} set Transaction failures alerts: ${i.failedInRow} failed / ${i.pendingInRow} pending in a row`);
+          return json(res, 200, { ok: true });
+        }
+
+        // POST /api/incoming/new-url  – new random token (old URL stops working)
+        if (req.method === 'POST' && parts[2] === 'new-url' && parts.length === 3) {
+          incoming.regenerate();
+          console.log(`[ADMIN] ${session.user} generated a new callback URL for Transaction failures`);
+          return json(res, 200, { ok: true });
+        }
+
+        // POST /api/incoming/test  { kind: failed|pending }
+        if (req.method === 'POST' && parts[2] === 'test' && parts.length === 3) {
+          const { kind } = await readBody(req);
+          await incoming.test(kind);
+          console.log(`[ADMIN] ${session.user} sent a test “${kind} in a row” alert`);
+          return json(res, 200, { ok: true });
+        }
+      }
+
+      // --- Balance check: low-balance alert history / send now / test ---
+      if (parts[1] === 'balance-alerts') {
+        // GET /api/balance-alerts
+        if (req.method === 'GET' && parts.length === 2) return json(res, 200, balanceAlerts.history());
+
+        // POST /api/balance-alerts/send  – check now and send the list of low accounts
+        if (req.method === 'POST' && parts[2] === 'send' && parts.length === 3) {
+          const r = await balanceAlerts.sendNow();
+          console.log(`[ADMIN] ${session.user} sent low-balance alerts now (${r.sent} account(s))`);
+          return json(res, 200, r);
+        }
+
+        // POST /api/balance-alerts/test  – sample low-balance alert
+        if (req.method === 'POST' && parts[2] === 'test' && parts.length === 3) {
+          await balanceAlerts.test();
+          console.log(`[ADMIN] ${session.user} sent a test low-balance alert`);
+          return json(res, 200, { ok: true });
         }
       }
 
